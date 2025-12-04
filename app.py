@@ -139,12 +139,12 @@ def get_snapshot_topology(log_returns, target_date, window_size, tickers):
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    window_size = st.slider("Lookback Window", 30, 90, 60)
-    smoothing_span = st.slider("Smoothing", 1, 50, 10)
+    window_size = st.slider("Lookback Window (days)", 30, 120, 60, help="Correlation window. 60 days captures medium-term regimes.")
+    smoothing_span = st.slider("Smoothing (EMA span)", 1, 50, 10, help="Exponential smoothing. 10 is light smoothing for responsiveness.")
     
     st.markdown("---")
     st.header("🚨 Thresholds")
-    percentile_threshold = st.slider("Critical %", 1, 20, 5)
+    percentile_threshold = st.slider("Critical % (5th=crash level)", 1, 20, 5, help="Percentile threshold. 5th percentile marks historically exceptional lows.")
     
     st.markdown("---")
     st.header("📅 Date Range")
@@ -270,7 +270,9 @@ with tab2:
                     if corr.iloc[i,j] > 0.6:
                         mds_fig.add_trace(go.Scatter(x=[coords[i,0], coords[j,0]], y=[coords[i,1], coords[j,1]], 
                                                    mode='lines', line=dict(color=f'rgba(255,0,0,{corr.iloc[i,j]})', width=2), showlegend=False))
-            mds_fig.update_layout(template="plotly_dark", showlegend=False, xaxis_visible=False, yaxis_visible=False)
+            mds_fig.update_layout(template="plotly_dark", showlegend=False, 
+                                 xaxis=dict(visible=True, title="MDS 1"),
+                                 yaxis=dict(visible=True, title="MDS 2"))
             st.plotly_chart(mds_fig, width='stretch')
         
         with c2:
