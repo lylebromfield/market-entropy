@@ -8,6 +8,7 @@ from ripser import ripser
 from sklearn.manifold import MDS
 from sklearn.decomposition import PCA
 import networkx as nx
+from scipy.stats import entropy as scipy_entropy
 from typing import Tuple, Optional
 from validation_module import EntropyValidator, create_validation_plots
 from optimizer_module import EntropyOptimizer
@@ -57,7 +58,7 @@ def fetch_market_data(tickers: list[str], benchmark_ticker: str) -> Tuple[pd.Dat
     Fetch OHLCV data for multiple tickers and compute log returns.
     
     Args:
-        tickers: List of stock ticker symbols
+        tickers: List of stock ticker symbols (11 SPDR sector ETFs)
         benchmark_ticker: Benchmark index ticker (e.g., '^GSPC' for S&P 500)
     
     Returns:
@@ -253,6 +254,72 @@ def _run_takens_pipeline_impl(price_series: pd.Series, window_size: int, stride:
     progress_bar.empty()
     return pd.Series(entropies, index=dates)
 
+@st.cache_data
+def run_shannon_pipeline(price_series: pd.Series, window_size: int, stride: int = 1) -> pd.Series:
+    """
+    Compute Shannon entropy of return distribution (measures chaos/surprise).
+    
+    Wrapper for caching that calls the implementation function with data hash.
+    
+    Args:
+        price_series: Price series for single asset
+        window_size: Sliding window size in days
+        stride: Step size between windows
+    
+    Returns:
+        Series of Shannon entropy values indexed by dates
+    """
+    data_hash = hash((tuple(price_series.index), len(price_series), float(price_series.iloc[0])))
+    return _run_shannon_pipeline_impl(price_series, window_size, stride, data_hash)
+
+@st.cache_data
+def _run_shannon_pipeline_impl(price_series: pd.Series, window_size: int, stride: int, _data_hash: int) -> pd.Series:
+    """
+    Implementation of Shannon entropy computation.
+    
+    For each sliding window:
+    1. Compute log returns
+    2. Create histogram to approximate probability distribution
+    3. Calculate Shannon entropy: -sum(p * log(p))
+    
+    High entropy = fat tails, wild moves (crisis/crash)
+    Low entropy = normal distribution, predictable (quiet market)
+    
+    Args:
+        price_series: Price series for single asset
+        window_size: Window size in days
+        stride: Step size between windows
+        _data_hash: Cache key (unused but required for Streamlit caching)
+    
+    Returns:
+        Series of Shannon entropy values
+    """
+    returns = np.log(price_series / price_series.shift(1)).dropna()
+    n_samples = len(returns)
+    shannon_vals = []
+    dates = []
+    
+    progress_bar = st.progress(0, text="Computing return distribution entropy...")
+    total_windows = (n_samples - window_size) // stride
+    
+    for idx, i in enumerate(range(window_size, n_samples, stride)):
+        window_data = returns.iloc[i-window_size:i].values
+        
+        # Create histogram to approximate probability distribution
+        counts, _ = np.histogram(window_data, bins='auto', density=True)
+        
+        # Calculate Shannon entropy (add epsilon to avoid log(0))
+        S = scipy_entropy(counts + 1e-10)
+        
+        shannon_vals.append(S)
+        dates.append(returns.index[i])
+        
+        if idx % max(1, total_windows // 20) == 0:
+            progress_bar.progress(min(idx / total_windows, PROGRESS_BAR_MAX), text="Computing return distribution entropy...")
+    
+    progress_bar.empty()
+    return pd.Series(shannon_vals, index=dates)
+
 def get_snapshot_topology(log_returns: pd.DataFrame, target_date: pd.Timestamp, 
                           window_size: int, tickers: list[str]) -> Tuple[Optional[np.ndarray], Optional[pd.DataFrame]]:
     """
@@ -312,7 +379,20 @@ with st.sidebar:
 
 st.title("Market Entropy")
 
-tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA']
+# The 11 SPDR Sector ETFs (Full US Economy Coverage)
+tickers = [
+    'XLK',  # Technology
+    'XLF',  # Financials
+    'XLV',  # Healthcare
+    'XLE',  # Energy
+    'XLC',  # Communication Services
+    'XLI',  # Industrials
+    'XLP',  # Consumer Staples
+    'XLY',  # Consumer Discretionary
+    'XLU',  # Utilities
+    'XLB',  # Materials
+    'XLRE'  # Real Estate
+]
 mag7_returns_full, sp500_price_full = fetch_market_data(tickers, "^GSPC")
 
 if len(mag7_returns_full) == 0 or len(sp500_price_full) == 0:
@@ -329,46 +409,52 @@ sp500_price_full = sp500_price_full.loc[common_index_full]
 
 corr_entropy_full = run_tda_pipeline(mag7_returns_full, window_size)
 takens_entropy_full = run_takens_pipeline(sp500_price_full, window_size, stride=1, dimension=takens_dimension, delay=takens_delay)
+shannon_entropy_full = run_shannon_pipeline(sp500_price_full, window_size, stride=1)
 
-if len(corr_entropy_full) == 0 or len(takens_entropy_full) == 0:
+if len(corr_entropy_full) == 0 or len(takens_entropy_full) == 0 or len(shannon_entropy_full) == 0:
     st.error("Insufficient data for TDA computation")
     st.stop()
 
-common_start = max(corr_entropy_full.index[0], takens_entropy_full.index[0], start_date)
-common_end = min(corr_entropy_full.index[-1], takens_entropy_full.index[-1], end_date)
+common_start = max(corr_entropy_full.index[0], takens_entropy_full.index[0], shannon_entropy_full.index[0], start_date)
+common_end = min(corr_entropy_full.index[-1], takens_entropy_full.index[-1], shannon_entropy_full.index[-1], end_date)
 
 mag7_returns = mag7_returns_full.loc[common_start:common_end]
 sp500_price = sp500_price_full.loc[common_start:common_end]
 corr_entropy = corr_entropy_full.loc[common_start:common_end]
 takens_entropy = takens_entropy_full.loc[common_start:common_end]
+shannon_entropy = shannon_entropy_full.loc[common_start:common_end]
 
 if len(mag7_returns) < window_size or len(sp500_price) < window_size:
     st.error(f"Insufficient data. Need at least {window_size} days in selected range")
     st.stop()
 
-if len(corr_entropy) == 0 or len(takens_entropy) == 0:
+if len(corr_entropy) == 0 or len(takens_entropy) == 0 or len(shannon_entropy) == 0:
     st.error("Insufficient data after calculations. Try a larger date range")
     st.stop()
 
 # Processing
-common_index = corr_entropy.index.intersection(takens_entropy.index)
+common_index = corr_entropy.index.intersection(takens_entropy.index).intersection(shannon_entropy.index)
 corr_entropy = corr_entropy.loc[common_index]
 takens_entropy = takens_entropy.loc[common_index]
+shannon_entropy = shannon_entropy.loc[common_index]
 
 norm_corr = (corr_entropy - corr_entropy.mean()) / corr_entropy.std()
 norm_takens = (takens_entropy - takens_entropy.mean()) / takens_entropy.std()
+norm_shannon = (shannon_entropy - shannon_entropy.mean()) / shannon_entropy.std()
 
 signal_correlation = float(norm_corr.corr(norm_takens))
+shannon_takens_corr = float(norm_shannon.corr(norm_takens))
 
-stacked_signals = np.column_stack([norm_corr, norm_takens])
+stacked_signals = np.column_stack([norm_corr, norm_takens, norm_shannon])
 pca = PCA(n_components=1)
 pca_weights = np.abs(pca.fit_transform(stacked_signals).flatten())
 pca_weights = pca_weights / pca_weights.sum()
 
-pca_weight_corr = float(pca.components_[0, 0] ** 2 / (pca.components_[0, 0] ** 2 + pca.components_[0, 1] ** 2))
-pca_weight_takens = 1 - pca_weight_corr
+pca_weight_corr = float(pca.components_[0, 0] ** 2 / (pca.components_[0, 0] ** 2 + pca.components_[0, 1] ** 2 + pca.components_[0, 2] ** 2))
+pca_weight_takens = float(pca.components_[0, 1] ** 2 / (pca.components_[0, 0] ** 2 + pca.components_[0, 1] ** 2 + pca.components_[0, 2] ** 2))
+pca_weight_shannon = 1 - pca_weight_corr - pca_weight_takens
 
-combined_signal = pca_weight_corr * norm_corr + pca_weight_takens * norm_takens
+combined_signal = pca_weight_corr * norm_corr + pca_weight_takens * norm_takens + pca_weight_shannon * norm_shannon
 signal_smooth = combined_signal.ewm(span=smoothing_span).mean()
 
 signal_sharpe = float(combined_signal.mean() / combined_signal.std() * np.sqrt(252)) if combined_signal.std() > 0 else 0
@@ -438,16 +524,23 @@ else:
 tab1, tab2, tab3, tab4 = st.tabs(["Signal", "Inspector", "Validation", "Optimization"])
 
 with tab1:
-    st.info("📊 **Signal Methodology:** This dashboard analyzes market structural entropy using topological data analysis (TDA). Low entropy indicates: (1) heightened correlation among assets, (2) compressed network topology with reduced structural diversity, (3) system states theoretically associated with fragility. Historical analysis shows that low entropy periods, when traded contrarian long, have generated positive risk-adjusted returns in S&P 500 data. The default interpretation treats declining entropy as a contrarian opportunity, though alternative strategies can be evaluated in the Optimization tab.")
+    st.info("📊 **What does this dashboard show?** This dashboard analyzes market entropy using three complementary measures: (1) **Topological Entropy** from sector correlation structure (11 SPDR ETFs), (2) **Takens Embedding Entropy** from S&P 500 price dynamics, (3) **Shannon Entropy** from return distribution. Low topological entropy indicates systemic correlation risk. High Shannon entropy indicates wild, unpredictable moves. The combination provides a multi-dimensional view of market fragility.")
     
     c1, c2, c3 = st.columns(3)
     c1.metric("Status", status, msg, delta_color=color)
-    c2.metric("Structural Entropy (Z)", f"{latest_val:.2f}", f"Z-score: {z_score:.2f}")
+    c2.metric("TDA Structural Entropy (Z-score)", f"{latest_val:.2f}", f"Z-score: {z_score:.2f}")
     c3.metric("Risk Level", f"{risk_level}/5", "Multi-factor Risk Score")
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Scatter(x=view_signal.index, y=view_signal, name="Entropy", line=dict(color='#00ff00', width=2)), secondary_y=False)
+    
+    # Main entropy signals
+    view_corr = norm_corr.loc[view_signal.index]
+    view_shannon = norm_shannon.loc[view_signal.index]
+    fig.add_trace(go.Scatter(x=view_corr.index, y=view_corr, name="TDA Entropy", line=dict(color='#00ff00', width=2)), secondary_y=False)
+    fig.add_trace(go.Scatter(x=view_shannon.index, y=view_shannon, name="Shannon Entropy", line=dict(color='rgba(189,0,255,0.4)', width=1.5)), secondary_y=False)
     fig.add_trace(go.Scatter(x=view_threshold.index, y=view_threshold, name="Threshold", line=dict(color='red', dash='dot')), secondary_y=False)
+    
+    # S&P 500 price
     fig.add_trace(go.Scatter(x=view_sp500.index, y=view_sp500, name="S&P 500", line=dict(color='rgba(255,255,255,0.2)')), secondary_y=True)
     
     fig.update_layout(template="plotly_dark", height=500, hovermode="x unified", legend=dict(orientation="h", y=1.02))
@@ -474,9 +567,9 @@ with tab1:
     
     with col3:
         st.metric(
-            "Corr Weight (PCA)",
-            f"{pca_weight_corr:.1%}",
-            help="PCA-optimized weight for correlation entropy"
+            "Shannon Entropy",
+            f"{norm_shannon.iloc[-1]:.2f}",
+            help="Return distribution entropy (Z-score). High = chaos/fat-tails"
         )
     
     with col4:
@@ -504,9 +597,9 @@ with tab1:
     
     with col3:
         st.metric(
-            "Price Trend (60d)",
-            f"{price_trend_60d*100:.2f}%",
-            help="60-day price change"
+            "Weights (C/T/S)",
+            f"{pca_weight_corr:.0%}/{pca_weight_takens:.0%}/{pca_weight_shannon:.0%}",
+            help="PCA weights: Corr/Takens/Shannon"
         )
     
     with col4:
