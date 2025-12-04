@@ -25,9 +25,8 @@ ENTROPY_REGULARIZATION = 1e-16
 TAKENS_DIMENSION = 4
 TAKENS_DELAY = 1
 ROLLING_WINDOW_DAYS = 252
-DRIFT_EXTREME_PERCENTILE = 99
-DRIFT_SEVERE_PERCENTILE = 95
-DRIFT_ELEVATED_PERCENTILE = 90
+Z_SCORE_EXTREME_THRESHOLD = -2.0
+Z_SCORE_SEVERE_THRESHOLD = -3.0
 PRICE_DRAWDOWN_THRESHOLD = -0.05
 PRICE_DRAWDOWN_60D_THRESHOLD = -0.05
 FNN_DIMENSION_THRESHOLD = 1.0
@@ -37,8 +36,8 @@ P_VALUE_SIGNIFICANCE = 0.05
 PROGRESS_BAR_MAX = 1.0
 
 st.set_page_config(
-    page_title="Systemic Drift",
-    page_icon="🌊",
+    page_title="Market Entropy",
+    page_icon="📉",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -468,7 +467,7 @@ with st.sidebar:
     start_date = pd.to_datetime(f"{date_range[0]}-01-01")
     end_date = pd.to_datetime(f"{date_range[1]}-12-31")
 
-st.title("Systemic Drift Monitor")
+st.title("Market Entropy")
 
 # The 11 SPDR Sector ETFs (Full US Economy Coverage)
 tickers = [

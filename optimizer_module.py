@@ -16,20 +16,23 @@ class EntropyOptimizer:
     """
     
     def __init__(self, mag7_returns: pd.DataFrame, sp500_price: pd.Series, 
-                 run_tda_pipeline: Callable, run_takens_pipeline: Callable) -> None:
+                 run_tda_pipeline: Callable, run_takens_pipeline: Callable,
+                 run_shannon_pipeline: Optional[Callable] = None) -> None:
         """
         Initialize optimizer with market data and entropy functions.
         
         Args:
-            mag7_returns: Log returns of Magnificent 7 stocks
+            mag7_returns: Log returns of sector ETFs
             sp500_price: S&P 500 price series
             run_tda_pipeline: Function to compute correlation-based entropy
             run_takens_pipeline: Function to compute Takens embedding entropy
+            run_shannon_pipeline: Function to compute Shannon entropy (optional)
         """
         self.mag7_returns = mag7_returns
         self.sp500_price = sp500_price
         self.run_tda_pipeline = run_tda_pipeline
         self.run_takens_pipeline = run_takens_pipeline
+        self.run_shannon_pipeline = run_shannon_pipeline
     
     def _compute_signal(self, window_size: int, smoothing_span: int, corr_weight: float | str, 
                        threshold_pct: float) -> Tuple[Optional[pd.Series], Optional[float]]:
@@ -52,21 +55,47 @@ class EntropyOptimizer:
             corr_entropy = self.run_tda_pipeline(self.mag7_returns, window_size)
             takens_entropy = self.run_takens_pipeline(self.sp500_price, window_size)
             
-            common_index = corr_entropy.index.intersection(takens_entropy.index)
-            corr_entropy = corr_entropy.loc[common_index]
-            takens_entropy = takens_entropy.loc[common_index]
-            
-            norm_corr = (corr_entropy - corr_entropy.mean()) / corr_entropy.std()
-            norm_takens = (takens_entropy - takens_entropy.mean()) / takens_entropy.std()
-            
-            if corr_weight == 'pca':
-                stacked_signals = np.column_stack([norm_corr, norm_takens])
-                pca = PCA(n_components=1)
-                pca.fit(stacked_signals)
-                pca_weight_corr = float(pca.components_[0, 0] ** 2 / (pca.components_[0, 0] ** 2 + pca.components_[0, 1] ** 2))
-                combined_signal = pca_weight_corr * norm_corr + (1 - pca_weight_corr) * norm_takens
+            # If Shannon entropy is available, use 3-signal system
+            if self.run_shannon_pipeline is not None:
+                shannon_entropy = self.run_shannon_pipeline(self.sp500_price, window_size)
+                common_index = corr_entropy.index.intersection(takens_entropy.index).intersection(shannon_entropy.index)
+                corr_entropy = corr_entropy.loc[common_index]
+                takens_entropy = takens_entropy.loc[common_index]
+                shannon_entropy = shannon_entropy.loc[common_index]
+                
+                norm_corr = (corr_entropy - corr_entropy.mean()) / corr_entropy.std()
+                norm_takens = (takens_entropy - takens_entropy.mean()) / takens_entropy.std()
+                norm_shannon = (shannon_entropy - shannon_entropy.mean()) / shannon_entropy.std()
+                
+                if corr_weight == 'pca':
+                    stacked_signals = np.column_stack([norm_corr, norm_takens, norm_shannon])
+                    pca = PCA(n_components=1)
+                    pca.fit(stacked_signals)
+                    pca_weight_corr = float(pca.components_[0, 0] ** 2 / (pca.components_[0, 0] ** 2 + pca.components_[0, 1] ** 2 + pca.components_[0, 2] ** 2))
+                    pca_weight_takens = float(pca.components_[0, 1] ** 2 / (pca.components_[0, 0] ** 2 + pca.components_[0, 1] ** 2 + pca.components_[0, 2] ** 2))
+                    pca_weight_shannon = 1 - pca_weight_corr - pca_weight_takens
+                    combined_signal = pca_weight_corr * norm_corr + pca_weight_takens * norm_takens + pca_weight_shannon * norm_shannon
+                else:
+                    # When not using PCA, distribute remaining weight equally between Takens and Shannon
+                    takens_shannon_weight = (1 - corr_weight) / 2
+                    combined_signal = corr_weight * norm_corr + takens_shannon_weight * norm_takens + takens_shannon_weight * norm_shannon
             else:
-                combined_signal = corr_weight * norm_corr + (1 - corr_weight) * norm_takens
+                # Original 2-signal system
+                common_index = corr_entropy.index.intersection(takens_entropy.index)
+                corr_entropy = corr_entropy.loc[common_index]
+                takens_entropy = takens_entropy.loc[common_index]
+                
+                norm_corr = (corr_entropy - corr_entropy.mean()) / corr_entropy.std()
+                norm_takens = (takens_entropy - takens_entropy.mean()) / takens_entropy.std()
+                
+                if corr_weight == 'pca':
+                    stacked_signals = np.column_stack([norm_corr, norm_takens])
+                    pca = PCA(n_components=1)
+                    pca.fit(stacked_signals)
+                    pca_weight_corr = float(pca.components_[0, 0] ** 2 / (pca.components_[0, 0] ** 2 + pca.components_[0, 1] ** 2))
+                    combined_signal = pca_weight_corr * norm_corr + (1 - pca_weight_corr) * norm_takens
+                else:
+                    combined_signal = corr_weight * norm_corr + (1 - corr_weight) * norm_takens
             
             signal_smooth = combined_signal.ewm(span=smoothing_span).mean()
             
