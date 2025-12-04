@@ -7,3 +7,4 @@ ripser
 scikit-learn
 scipy
 networkx
+giotto-tda==0.6.1
