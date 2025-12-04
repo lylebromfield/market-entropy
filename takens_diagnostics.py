@@ -50,7 +50,7 @@ def find_optimal_delay(price_series: pd.Series, method: str = 'first_zero', max_
         if len(zero_crossings) > 0:
             return int(zero_crossings[0]) + 1
         else:
-            return max(1, np.argmin(np.abs(autocorr)))
+            return int(max(1, np.argmin(np.abs(autocorr))))
     elif method == 'first_minimum':
         return int(np.argmin(autocorr[1:])) + 1
     else:

@@ -144,7 +144,7 @@ class EntropyValidator:
             'false_negatives': int(fn)
         }
     
-    def monte_carlo_test(self, n_simulations: int = 1000, horizons: list[int] = None) -> Dict[int, Dict[str, Any]]:
+    def monte_carlo_test(self, n_simulations: int = 1000, horizons: Optional[list[int]] = None) -> Dict[int, Dict[str, Any]]:
         """
         Assess statistical significance of alert signal via Monte Carlo shuffling.
         
@@ -328,7 +328,7 @@ def create_validation_plots(validator: EntropyValidator, alerts: pd.Series, forw
             row=2, col=2
         )
     
-    fig.add_hline(y=validator.threshold, line_dash="dash", line_color="red", row=2, col=2)
+    fig.add_hline(y=validator.threshold, line_dash="dash", line_color="red", row="2", col="2")
     
     fig.update_xaxes(title_text="", row=1, col=1)
     fig.update_yaxes(title_text="20d Return (%)", row=1, col=1)
