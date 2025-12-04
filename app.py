@@ -9,6 +9,9 @@ from sklearn.manifold import MDS
 from sklearn.decomposition import PCA
 import networkx as nx
 from scipy.stats import entropy as scipy_entropy
+import time
+import random
+import warnings
 try:
     from gtda.homology import VietorisRipsPersistence
     from gtda.diagrams import Amplitude
@@ -40,6 +43,10 @@ CORRELATION_THRESHOLD_DEFAULT = 0.6
 CORRELATION_DISTANCE_COEFFICIENT = np.sqrt(2)
 P_VALUE_SIGNIFICANCE = 0.05
 PROGRESS_BAR_MAX = 1.0
+FETCH_RETRIES = 3
+FETCH_BACKOFF_BASE = 1.0
+
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="persim")
 
 st.set_page_config(
     page_title="Market Entropy",
@@ -76,22 +83,31 @@ def fetch_market_data(tickers: list[str], benchmark_ticker: str) -> Tuple[pd.Dat
     Returns:
         Tuple of (log_returns DataFrame, benchmark price Series)
     """
-    try:
-        data = yf.download(tickers, start="2000-01-01", interval="1d", auto_adjust=True, group_by='column', progress=False)
-        if 'Close' in data.columns:
-            data = data['Close']
-        log_returns = np.log(data / data.shift(1)).dropna()
-        
-        benchmark_data = yf.download(benchmark_ticker, start="2000-01-01", interval="1d", auto_adjust=True, progress=False)
-        if 'Close' in benchmark_data.columns:
-            benchmark_data = benchmark_data['Close']
-        if isinstance(benchmark_data, pd.DataFrame):
-            benchmark_data = benchmark_data.squeeze()
+    last_error: Exception | None = None
+    for attempt in range(FETCH_RETRIES):
+        try:
+            data = yf.download(tickers, start="2000-01-01", interval="1d", auto_adjust=True, group_by='column', progress=False)
+            if 'Close' in data.columns:
+                data = data['Close']
+            log_returns = np.log(data / data.shift(1)).dropna()
             
-        return log_returns, benchmark_data
-    except Exception as e:
-        st.error(f"Error fetching data: {str(e)}")
-        return pd.DataFrame(), pd.Series(dtype=float)
+            benchmark_data = yf.download(benchmark_ticker, start="2000-01-01", interval="1d", auto_adjust=True, progress=False)
+            if 'Close' in benchmark_data.columns:
+                benchmark_data = benchmark_data['Close']
+            if isinstance(benchmark_data, pd.DataFrame):
+                benchmark_data = benchmark_data.squeeze()
+                
+            return log_returns, benchmark_data
+        except Exception as e:
+            last_error = e
+            if attempt < FETCH_RETRIES - 1:
+                sleep_for = FETCH_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 0.5)
+                st.warning(f"Data fetch failed (attempt {attempt+1}/{FETCH_RETRIES}): {e}. Retrying in {sleep_for:.1f}s...")
+                time.sleep(sleep_for)
+            else:
+                st.error(f"Error fetching data: {str(e)}")
+                return pd.DataFrame(), pd.Series(dtype=float)
+    return pd.DataFrame(), pd.Series(dtype=float)
 
 def _compute_data_hash(data: pd.DataFrame | pd.Series) -> int:
     """
