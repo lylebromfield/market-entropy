@@ -3,7 +3,7 @@ import numpy as np
 from scipy import stats
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 class EntropyValidator:
     """
@@ -328,7 +328,7 @@ def create_validation_plots(validator: EntropyValidator, alerts: pd.Series, forw
             row=2, col=2
         )
     
-    fig.add_hline(y=validator.threshold, line_dash="dash", line_color="red", row="2", col="2")
+    fig.add_hline(y=validator.threshold, line_dash="dash", line_color="red", row=2, col=2)
     
     fig.update_xaxes(title_text="", row=1, col=1)
     fig.update_yaxes(title_text="20d Return (%)", row=1, col=1)

@@ -83,6 +83,7 @@ def false_nearest_neighbors(price_series: pd.Series, max_dimension: int = 10, de
         return None
     
     fnn_percentages = []
+    max_samples = 200  # Limit computation for performance
     
     for d in range(1, max_dimension + 1):
         embedded_d = []
@@ -102,12 +103,27 @@ def false_nearest_neighbors(price_series: pd.Series, max_dimension: int = 10, de
         if len(embedded_d_plus_1) == 0:
             break
         
+        # Sample points if too many (for performance)
+        n_points = min(len(embedded_d_plus_1), max_samples)
+        if len(embedded_d_plus_1) > max_samples:
+            sample_idx = np.random.choice(len(embedded_d_plus_1), max_samples, replace=False)
+        else:
+            sample_idx = range(n_points)
+        
         fnn_count = 0
         rt_threshold = 10
         
-        for i in range(min(len(embedded_d), len(embedded_d_plus_1))):
-            distances_d = np.linalg.norm(embedded_d - embedded_d[i], axis=1)
+        for i in sample_idx:
+            # Only compare with points that exist in both embeddings
+            if i >= len(embedded_d_plus_1):
+                continue
+                
+            distances_d = np.linalg.norm(embedded_d[:len(embedded_d_plus_1)] - embedded_d[i], axis=1)
             nn_idx = np.argsort(distances_d)[1]
+            
+            # Ensure nn_idx is valid for d+1 embedding
+            if nn_idx >= len(embedded_d_plus_1):
+                continue
             
             dist_d = distances_d[nn_idx]
             if dist_d > 0:
@@ -117,7 +133,7 @@ def false_nearest_neighbors(price_series: pd.Series, max_dimension: int = 10, de
                 if rt > rt_threshold:
                     fnn_count += 1
         
-        fnn_pct = 100 * fnn_count / len(embedded_d_plus_1)
+        fnn_pct = 100 * fnn_count / n_points
         fnn_percentages.append(fnn_pct)
     
     return fnn_percentages

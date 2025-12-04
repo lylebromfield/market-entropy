@@ -293,6 +293,11 @@ with st.sidebar:
     smoothing_span = st.slider("Smoothing (EMA span)", 1, 50, 10, help="Exponential smoothing. 10 is light smoothing for responsiveness.")
     
     st.markdown("---")
+    st.header("🔬 Takens Embedding")
+    takens_delay = st.slider("Takens Delay", 1, 10, TAKENS_DELAY, help="Time lag for embedding. Use diagnostics to find optimal value.")
+    takens_dimension = st.slider("Takens Dimension", 2, 6, TAKENS_DIMENSION, help="Embedding dimension. Use diagnostics (FNN) to find optimal value.")
+    
+    st.markdown("---")
     st.header("🚨 Thresholds")
     percentile_threshold = st.slider("Critical % (5th=crash level)", 1, 20, 5, help="Percentile threshold. 5th percentile marks historically exceptional lows.")
     
@@ -323,7 +328,7 @@ mag7_returns_full = mag7_returns_full.loc[common_index_full]
 sp500_price_full = sp500_price_full.loc[common_index_full]
 
 corr_entropy_full = run_tda_pipeline(mag7_returns_full, window_size)
-takens_entropy_full = run_takens_pipeline(sp500_price_full, window_size)
+takens_entropy_full = run_takens_pipeline(sp500_price_full, window_size, stride=1, dimension=takens_dimension, delay=takens_delay)
 
 if len(corr_entropy_full) == 0 or len(takens_entropy_full) == 0:
     st.error("Insufficient data for TDA computation")
@@ -433,10 +438,12 @@ else:
 tab1, tab2, tab3, tab4 = st.tabs(["Signal", "Inspector", "Validation", "Optimization"])
 
 with tab1:
+    st.info("📊 **Signal Methodology:** This dashboard analyzes market structural entropy using topological data analysis (TDA). Low entropy indicates: (1) heightened correlation among assets, (2) compressed network topology with reduced structural diversity, (3) system states theoretically associated with fragility. Historical analysis shows that low entropy periods, when traded contrarian long, have generated positive risk-adjusted returns in S&P 500 data. The default interpretation treats declining entropy as a contrarian opportunity, though alternative strategies can be evaluated in the Optimization tab.")
+    
     c1, c2, c3 = st.columns(3)
     c1.metric("Status", status, msg, delta_color=color)
-    c2.metric("Entropy (Z)", f"{latest_val:.2f}", f"{z_score:.2f}")
-    c3.metric("Risk Level", f"{risk_level}/5", "Statistical Risk Score")
+    c2.metric("Structural Entropy (Z)", f"{latest_val:.2f}", f"Z-score: {z_score:.2f}")
+    c3.metric("Risk Level", f"{risk_level}/5", "Multi-factor Risk Score")
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Scatter(x=view_signal.index, y=view_signal, name="Entropy", line=dict(color='#00ff00', width=2)), secondary_y=False)
@@ -474,9 +481,9 @@ with tab1:
     
     with col4:
         st.metric(
-            "Signal Sharpe",
+            "Signal Stability (Sharpe-style)",
             f"{signal_sharpe:.3f}",
-            help="Risk-adjusted signal strength"
+            help="Risk-adjusted signal strength (not a P&L Sharpe ratio)"
         )
     
     col1, col2, col3, col4 = st.columns(4)
@@ -509,6 +516,21 @@ with tab1:
             help="252-day rolling average entropy"
         )
     
+    # Actionable summary based on regime
+    if risk_level >= 3:
+        summary_color = "🔴"
+        summary_text = f"**{summary_color} Elevated Risk Regime:** Current entropy is {abs(z_score):.1f} standard deviations below normal. Historically, similar conditions have preceded increased volatility and drawdowns. See Validation tab for statistical evidence."
+    elif risk_level >= 1:
+        summary_color = "🟡"
+        summary_text = f"**{summary_color} Monitoring:** Entropy shows some stress (Z={z_score:.1f}), but price action remains relatively stable. Watch for deterioration in trend metrics."
+    else:
+        summary_color = "🟢"
+        summary_text = f"**{summary_color} Normal Market Structure:** Entropy levels within historical norms (Z={z_score:.1f}). No immediate structural concerns detected."
+    
+    st.markdown("---")
+    st.markdown(summary_text)
+    st.markdown("---")
+    
     with st.expander("ℹ️ Risk Classification Details", expanded=False):
         st.markdown(f"""
         ### Statistical Risk Framework
@@ -516,11 +538,12 @@ with tab1:
         **Z-Score Analysis:**
         - Current Z-Score: {z_score:.2f}
         - Interpretation: {z_score:.2f} standard deviations from 252-day mean
-        - Thresholds: 
-          - > -1.0: Normal market
-          - -1.0 to -2.0: Below average entropy
-          - < -2.0: Extreme low entropy
-          - < -3.0: Severe low entropy
+        
+        **Z-Score Thresholds:**
+        - Greater than -1.0: Normal market conditions
+        - -1.0 to -2.0: Below average entropy (monitoring)
+        - -2.0 to -3.0: Extreme low entropy (elevated risk)
+        - Less than -3.0: Severe low entropy (critical risk)
         
         **Price Momentum:**
         - 5-day change: {price_trend_5d*100:.2f}% (immediate)
@@ -627,6 +650,10 @@ with tab2:
             st.metric("Avg Centrality", f"{avg_centrality:.3f}", help="Average betweenness centrality")
             st.metric("Network Density", f"{density:.3f}", help="Ratio of actual to possible connections")
             
+            # Warn about sparse networks
+            if density < 0.2:
+                st.warning(f"⚠️ **Network Sparsity Alert:** Current correlation threshold ({corr_threshold:.2f}) yields {density:.1%} network density. Centrality metrics may exhibit reduced reliability. Consider lowering the threshold for enhanced network analysis.")
+            
             st.markdown("**Top Central Stocks**")
             sorted_centrality = sorted(centrality.items(), key=lambda x: x[1], reverse=True)
             for idx, (node, cent) in enumerate(sorted_centrality[:3]):
@@ -678,14 +705,28 @@ with tab2:
             st.markdown("**Determining Optimal Embedding Parameters**")
             
             try:
+                progress_text = st.empty()
+                progress_bar = st.progress(0)
+                
+                progress_text.text("Computing autocorrelation...")
                 snap_idx = sp500_price_full.index.get_indexer([snap_date], method='nearest')[0]
                 window_end = min(snap_idx + 1, len(sp500_price_full))
-                window_start = max(0, window_end - 500)
+                window_start = max(0, window_end - 252)  # Reduced from 500 to 252 for performance
                 
                 diagnostic_prices = sp500_price_full.iloc[window_start:window_end]
                 
+                progress_bar.progress(0.2)
+                progress_text.text("Finding optimal delay...")
                 optimal_delay = find_optimal_delay(diagnostic_prices, method='first_zero')
+                
+                progress_bar.progress(0.4)
+                progress_text.text("Computing false nearest neighbors, please wait...")
                 fnn_percentages = false_nearest_neighbors(diagnostic_prices, max_dimension=10, delay=optimal_delay)
+                
+                progress_bar.progress(1.0)
+                progress_text.text("✅ Diagnostics complete!")
+                progress_bar.empty()
+                progress_text.empty()
                 
                 if fnn_percentages:
                     optimal_dimension = find_optimal_dimension(fnn_percentages, threshold=FNN_DIMENSION_THRESHOLD)
@@ -698,8 +739,8 @@ with tab2:
                         st.metric("Optimal Dimension", f"{optimal_dimension}", help="Embedding dimension from FNN")
                     
                     with col_diag2:
-                        st.metric("Current Delay (app)", "1", help="Fixed delay used in visualization")
-                        st.metric("Current Dimension (app)", "3", help="Fixed dimension used in visualization")
+                        st.metric("Current Delay (app)", f"{takens_delay}", help="Active delay setting (adjust in sidebar)")
+                        st.metric("Current Dimension (app)", f"{takens_dimension}", help="Active dimension setting (adjust in sidebar)")
                     
                     diag_col1, diag_col2 = st.columns(2)
                     
@@ -746,24 +787,26 @@ with tab2:
                     - **Optimal Delay**: {optimal_delay} days
                       - First point where autocorrelation crosses zero
                       - At this lag, returns are relatively independent
-                      - Current app uses delay=1 (assumes no autocorrelation)
+                      - Current setting: {takens_delay} day(s)
                     
                     - **Optimal Dimension**: {optimal_dimension}
                       - False Nearest Neighbors fall below 1% at dimension {optimal_dimension}
                       - This is the minimum dimension to unfold the attractor
-                      - Current app uses dimension=3 (reasonable but may be suboptimal)
+                      - Current setting: {takens_dimension}
                     
-                    **Recommendation:** For more accurate Takens reconstruction, use delay={optimal_delay} and dimension={optimal_dimension}
+                    **Recommendation:** {"✅ Current settings match diagnostic recommendations" if takens_delay == optimal_delay and takens_dimension == optimal_dimension else f"Consider adjusting sidebar to delay={optimal_delay}, dimension={optimal_dimension} for optimal reconstruction"}
                     """)
                 else:
-                    st.warning("Could not compute diagnostics for this date range")
+                    st.warning("Insufficient data for diagnostics computation")
             
             except Exception as e:
-                st.info("Takens diagnostics: Computing optimal parameters...")
+                st.warning(f"Diagnostic computation unavailable: {str(e)}")
 
 
 with tab3:
     st.header("🔬 Signal Validation")
+    
+    st.warning("⚠️ **Disclaimer:** All backtested results are hypothetical and do not reflect actual trading. Analysis excludes transaction costs, slippage, and market impact. Past performance does not guarantee future results.")
     
     st.markdown("""
     This validation suite tests whether low entropy signals actually predict market stress.
@@ -771,19 +814,19 @@ with tab3:
     """)
     
     with st.spinner("Running validation tests..."):
-        validator = EntropyValidator(
-            signal=signal_smooth,
-            prices=sp500_price_full.loc[signal_smooth.index],
-            threshold=historical_threshold_val
-        )
-        
-        alerts = validator.generate_alerts(lookback=5)
-        forward_returns = validator.compute_forward_returns([5, 10, 20, 60])
-        
-        perf_metrics = validator.alert_performance(forward_returns, alerts)
-        dd_metrics = validator.drawdown_prediction(drawdown_threshold=-0.10)
-        mc_results = validator.monte_carlo_test(n_simulations=1000, horizons=[20])
-        regime_stats = validator.regime_analysis()
+            validator = EntropyValidator(
+                signal=signal_smooth,
+                prices=sp500_price_full.loc[signal_smooth.index],
+                threshold=historical_threshold_val
+            )
+            
+            alerts = validator.generate_alerts(lookback=5)
+            forward_returns = validator.compute_forward_returns([5, 10, 20, 60])
+            
+            perf_metrics = validator.alert_performance(forward_returns, alerts)
+            dd_metrics = validator.drawdown_prediction(drawdown_threshold=-0.10)
+            mc_results = validator.monte_carlo_test(n_simulations=1000, horizons=[20])
+            regime_stats = validator.regime_analysis()
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -1011,18 +1054,20 @@ with tab3:
     
     st.markdown("---")
     st.info("""
-    **💡 Recommendations:**
+    **Analysis Guidelines:**
     
-    1. **If score < 50%:** Consider adjusting window size, threshold, or smoothing parameters
-    2. **High precision, low recall:** Your threshold may be too strict - try relaxing it
-    3. **Low precision, high recall:** Your threshold may be too loose - try tightening it
-    4. **Not beating random:** You may be overfitting to recent data - test on out-of-sample periods
+    1. **Score < 50%:** Consider adjusting window size, threshold, or smoothing parameters for improved signal quality
+    2. **High Precision, Low Recall:** Threshold may be overly conservative—consider relaxation for broader coverage
+    3. **Low Precision, High Recall:** Threshold may be insufficiently selective—consider tightening criteria
+    4. **Underperformance vs. Random:** Potential overfitting to in-sample data—validate on out-of-sample periods
     
-    **Remember:** Historical backtests don't guarantee future performance. Use this as one input
-    among many for decision-making.
+    **Note:** Historical validation metrics do not guarantee prospective performance. This analysis should complement, not replace, comprehensive risk assessment and portfolio construction frameworks.
     """)
 
 with tab4:
+    st.header("⚙️ Parameter Optimization")
+    
+    st.warning("⚠️ **Disclaimer:** Optimization results represent hypothetical backtests excluding transaction costs, slippage, and market impact. Optimized parameters may exhibit degraded out-of-sample performance due to overfitting.")
     st.header("🔧 Parameter Optimization")
     
     st.markdown("""
@@ -1110,7 +1155,10 @@ with tab4:
     st.info(f"**Total combinations to test: {num_combinations}**")
     
     if num_combinations > 500:
-        st.warning(f"⚠️ {num_combinations} combinations will take significant time. Consider narrowing ranges.")
+        st.error(f"⚠️ **Parameter Space Exceeds Limit:** {num_combinations} combinations exceeds the 500 configuration maximum. Please reduce parameter ranges or use Walk-Forward optimization with coarser grid spacing.")
+        st.stop()
+    elif num_combinations > 200:
+        st.warning(f"⚠️ **Computation Time:** Testing {num_combinations} configurations may require approximately {num_combinations//10} minutes.")
     
     if opt_method == "Walk-Forward":
         st.markdown("---")
@@ -1157,7 +1205,7 @@ with tab4:
                 )
             
             if len(results_df) == 0:
-                st.error("No valid results found. Try adjusting parameter ranges.")
+                st.error("Optimization produced no valid results. Consider adjusting parameter ranges.")
                 st.stop()
             
             st.session_state['opt_results'] = results_df
@@ -1165,7 +1213,7 @@ with tab4:
             st.session_state['opt_direction'] = direction
             st.session_state['optimizer'] = optimizer
         
-        st.success(f"✅ Optimization complete! Found {len(results_df)} valid configurations.")
+        st.success(f"✅ Optimization Complete: {len(results_df)} configurations evaluated successfully.")
         st.rerun()
     
     if 'opt_results' in st.session_state:
