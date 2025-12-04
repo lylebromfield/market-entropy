@@ -6,3 +6,4 @@ plotly
 ripser
 scikit-learn
 scipy
+networkx
