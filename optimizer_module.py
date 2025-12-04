@@ -58,44 +58,52 @@ class EntropyOptimizer:
             # If Shannon entropy is available, use 3-signal system
             if self.run_shannon_pipeline is not None:
                 shannon_entropy = self.run_shannon_pipeline(self.sp500_price, window_size)
-                common_index = corr_entropy.index.intersection(takens_entropy.index).intersection(shannon_entropy.index)
+                # handle missing takens/shannon by intersecting only available
+                common_index = corr_entropy.index
+                if len(takens_entropy) > 0:
+                    common_index = common_index.intersection(takens_entropy.index)
+                if len(shannon_entropy) > 0:
+                    common_index = common_index.intersection(shannon_entropy.index)
                 corr_entropy = corr_entropy.loc[common_index]
-                takens_entropy = takens_entropy.loc[common_index]
-                shannon_entropy = shannon_entropy.loc[common_index]
+                takens_entropy = takens_entropy.loc[common_index] if len(takens_entropy) > 0 else pd.Series(0, index=common_index)
+                shannon_entropy = shannon_entropy.loc[common_index] if len(shannon_entropy) > 0 else pd.Series(0, index=common_index)
                 
-                norm_corr = (corr_entropy - corr_entropy.mean()) / corr_entropy.std()
-                norm_takens = (takens_entropy - takens_entropy.mean()) / takens_entropy.std()
-                norm_shannon = (shannon_entropy - shannon_entropy.mean()) / shannon_entropy.std()
+                norm_corr = (corr_entropy - corr_entropy.mean()) / (corr_entropy.std() + 1e-8)
+                norm_takens = (takens_entropy - takens_entropy.mean()) / (takens_entropy.std() + 1e-8)
+                norm_shannon = (shannon_entropy - shannon_entropy.mean()) / (shannon_entropy.std() + 1e-8)
                 
                 if corr_weight == 'pca':
                     stacked_signals = np.column_stack([norm_corr, norm_takens, norm_shannon])
                     pca = PCA(n_components=1)
                     pca.fit(stacked_signals)
-                    pca_weight_corr = float(pca.components_[0, 0] ** 2 / (pca.components_[0, 0] ** 2 + pca.components_[0, 1] ** 2 + pca.components_[0, 2] ** 2))
-                    pca_weight_takens = float(pca.components_[0, 1] ** 2 / (pca.components_[0, 0] ** 2 + pca.components_[0, 1] ** 2 + pca.components_[0, 2] ** 2))
+                    denom = (pca.components_[0, 0] ** 2 + pca.components_[0, 1] ** 2 + pca.components_[0, 2] ** 2)
+                    pca_weight_corr = float(pca.components_[0, 0] ** 2 / denom)
+                    pca_weight_takens = float(pca.components_[0, 1] ** 2 / denom)
                     pca_weight_shannon = 1 - pca_weight_corr - pca_weight_takens
                     combined_signal = pca_weight_corr * norm_corr + pca_weight_takens * norm_takens + pca_weight_shannon * norm_shannon
                 else:
-                    # When not using PCA, distribute remaining weight equally between Takens and Shannon
                     takens_shannon_weight = (1 - corr_weight) / 2
                     combined_signal = corr_weight * norm_corr + takens_shannon_weight * norm_takens + takens_shannon_weight * norm_shannon
             else:
-                # Original 2-signal system
-                common_index = corr_entropy.index.intersection(takens_entropy.index)
-                corr_entropy = corr_entropy.loc[common_index]
-                takens_entropy = takens_entropy.loc[common_index]
-                
-                norm_corr = (corr_entropy - corr_entropy.mean()) / corr_entropy.std()
-                norm_takens = (takens_entropy - takens_entropy.mean()) / takens_entropy.std()
-                
-                if corr_weight == 'pca':
-                    stacked_signals = np.column_stack([norm_corr, norm_takens])
-                    pca = PCA(n_components=1)
-                    pca.fit(stacked_signals)
-                    pca_weight_corr = float(pca.components_[0, 0] ** 2 / (pca.components_[0, 0] ** 2 + pca.components_[0, 1] ** 2))
-                    combined_signal = pca_weight_corr * norm_corr + (1 - pca_weight_corr) * norm_takens
+                # Original 2-signal system (or corr-only if takens missing)
+                if len(takens_entropy) > 0:
+                    common_index = corr_entropy.index.intersection(takens_entropy.index)
+                    corr_entropy = corr_entropy.loc[common_index]
+                    takens_entropy = takens_entropy.loc[common_index]
+                    norm_corr = (corr_entropy - corr_entropy.mean()) / (corr_entropy.std() + 1e-8)
+                    norm_takens = (takens_entropy - takens_entropy.mean()) / (takens_entropy.std() + 1e-8)
+                    if corr_weight == 'pca':
+                        stacked_signals = np.column_stack([norm_corr, norm_takens])
+                        pca = PCA(n_components=1)
+                        pca.fit(stacked_signals)
+                        pca_weight_corr = float(pca.components_[0, 0] ** 2 / (pca.components_[0, 0] ** 2 + pca.components_[0, 1] ** 2))
+                        combined_signal = pca_weight_corr * norm_corr + (1 - pca_weight_corr) * norm_takens
+                    else:
+                        combined_signal = corr_weight * norm_corr + (1 - corr_weight) * norm_takens
                 else:
-                    combined_signal = corr_weight * norm_corr + (1 - corr_weight) * norm_takens
+                    # corr-only path (used by drift-only pipeline)
+                    norm_corr = (corr_entropy - corr_entropy.mean()) / (corr_entropy.std() + 1e-8)
+                    combined_signal = norm_corr
             
             signal_smooth = combined_signal.ewm(span=smoothing_span).mean()
             
@@ -139,6 +147,18 @@ class EntropyOptimizer:
         
         cum_strategy = (1 + strategy_returns).cumprod()
         cum_bh = (1 + returns).cumprod()
+        
+        if len(cum_strategy) == 0 or len(cum_bh) == 0:
+            return {
+                'total_return': 0.0,
+                'annual_return': 0.0,
+                'sharpe': 0.0,
+                'max_dd': 0.0,
+                'win_rate': 0.0,
+                'num_trades': 0,
+                'bh_return': 0.0,
+                'bh_annual_return': 0.0
+            }
         
         total_return = float(cum_strategy.iloc[-1] - 1)
         bh_return = float(cum_bh.iloc[-1] - 1)
@@ -341,12 +361,27 @@ class EntropyOptimizer:
             Plotly Figure with 4 performance subplots
         """
         top_results = results_df.head(top_n)
+        # Ensure required columns exist; otherwise drop the corresponding subplot
+        has_drawdown = 'max_drawdown' in top_results.columns
+        has_winrate = 'win_rate' in top_results.columns
+        has_return = 'annual_return' in top_results.columns
         
+        specs = [[{'type': 'bar'}, {'type': 'bar'}], [{'type': 'bar'}, {'type': 'bar'}]]
+        titles = ['Sharpe Ratio', 'Annual Return', 'Max Drawdown', 'Win Rate']
+        if not has_return:
+            specs[0][1] = None
+            titles[1] = ''
+        if not has_drawdown:
+            specs[1][0] = None
+            titles[2] = ''
+        if not has_winrate:
+            specs[1][1] = None
+            titles[3] = ''
+
         fig = make_subplots(
             rows=2, cols=2,
-            subplot_titles=('Sharpe Ratio', 'Annual Return', 'Max Drawdown', 'Win Rate'),
-            specs=[[{'type': 'bar'}, {'type': 'bar'}],
-                   [{'type': 'bar'}, {'type': 'bar'}]]
+            subplot_titles=tuple(titles),
+            specs=specs
         )
         
         labels = [f"W{int(r['window_size'])} S{int(r['smoothing_span'])}" for _, r in top_results.iterrows()]
@@ -355,26 +390,30 @@ class EntropyOptimizer:
             go.Bar(y=top_results['sharpe'], name='Sharpe', marker_color='#00ff00', text=[f"{x:.2f}" for x in top_results['sharpe']], textposition='outside'),
             row=1, col=1
         )
-        
-        fig.add_trace(
-            go.Bar(y=top_results['annual_return']*100, name='Return', marker_color='#00ffff', text=[f"{x:.1f}%" for x in top_results['annual_return']*100], textposition='outside'),
-            row=1, col=2
-        )
-        
-        fig.add_trace(
-            go.Bar(y=top_results['max_drawdown']*100, name='Drawdown', marker_color='#ff0000', text=[f"{x:.1f}%" for x in top_results['max_drawdown']*100], textposition='outside'),
-            row=2, col=1
-        )
-        
-        fig.add_trace(
-            go.Bar(y=top_results['win_rate']*100, name='Win Rate', marker_color='#ffff00', text=[f"{x:.1f}%" for x in top_results['win_rate']*100], textposition='outside'),
-            row=2, col=2
-        )
+
+        if has_return:
+            fig.add_trace(
+                go.Bar(y=top_results['annual_return']*100, name='Return', marker_color='#00ffff', text=[f"{x:.1f}%" for x in top_results['annual_return']*100], textposition='outside'),
+                row=1, col=2
+            )
+        if has_drawdown:
+            fig.add_trace(
+                go.Bar(y=top_results['max_drawdown']*100, name='Drawdown', marker_color='#ff0000', text=[f"{x:.1f}%" for x in top_results['max_drawdown']*100], textposition='outside'),
+                row=2, col=1
+            )
+        if has_winrate:
+            fig.add_trace(
+                go.Bar(y=top_results['win_rate']*100, name='Win Rate', marker_color='#ffff00', text=[f"{x:.1f}%" for x in top_results['win_rate']*100], textposition='outside'),
+                row=2, col=2
+            )
         
         fig.update_yaxes(title_text="Sharpe", row=1, col=1)
-        fig.update_yaxes(title_text="Return %", row=1, col=2)
-        fig.update_yaxes(title_text="Drawdown %", row=2, col=1)
-        fig.update_yaxes(title_text="Win Rate %", row=2, col=2)
+        if has_return:
+            fig.update_yaxes(title_text="Return %", row=1, col=2)
+        if has_drawdown:
+            fig.update_yaxes(title_text="Drawdown %", row=2, col=1)
+        if has_winrate:
+            fig.update_yaxes(title_text="Win Rate %", row=2, col=2)
         
         fig.update_layout(
             template="plotly_dark",

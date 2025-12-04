@@ -25,9 +25,8 @@ ENTROPY_REGULARIZATION = 1e-16
 TAKENS_DIMENSION = 4
 TAKENS_DELAY = 1
 ROLLING_WINDOW_DAYS = 252
-DRIFT_EXTREME_PERCENTILE = 99
-DRIFT_SEVERE_PERCENTILE = 95
-DRIFT_ELEVATED_PERCENTILE = 90
+Z_SCORE_EXTREME_THRESHOLD = -2.0
+Z_SCORE_SEVERE_THRESHOLD = -3.0
 PRICE_DRAWDOWN_THRESHOLD = -0.05
 PRICE_DRAWDOWN_60D_THRESHOLD = -0.05
 FNN_DIMENSION_THRESHOLD = 1.0
@@ -37,8 +36,8 @@ P_VALUE_SIGNIFICANCE = 0.05
 PROGRESS_BAR_MAX = 1.0
 
 st.set_page_config(
-    page_title="Systemic Drift",
-    page_icon="🌊",
+    page_title="Market Entropy",
+    page_icon="📉",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -446,6 +445,14 @@ def get_snapshot_topology(log_returns: pd.DataFrame, target_date: pd.Timestamp,
 
 with st.sidebar:
     st.header("⚙️ Settings")
+    signal_options = ["TDA", "Shannon"] + (["Wasserstein"] if GTDA_AVAILABLE else [])
+    default_index = signal_options.index("Wasserstein") if GTDA_AVAILABLE else 0
+    primary_signal = st.radio(
+        "Primary Signal",
+        signal_options,
+        index=default_index,
+        help="Select which signal drives alarms, validation, and optimization"
+    )
     
     window_size = st.slider("Lookback Window (days)", 30, 120, 70, help="Correlation window. 70 days captures medium-term regimes.")
     smoothing_span = st.slider("Smoothing (EMA span)", 1, 50, 20, help="Exponential smoothing. 20 is moderate smoothing for clarity.")
@@ -468,7 +475,7 @@ with st.sidebar:
     start_date = pd.to_datetime(f"{date_range[0]}-01-01")
     end_date = pd.to_datetime(f"{date_range[1]}-12-31")
 
-st.title("Systemic Drift Monitor")
+st.title("Market Entropy")
 
 # The 11 SPDR Sector ETFs (Full US Economy Coverage)
 tickers = [
@@ -566,16 +573,43 @@ pca_weights = pca_weights / pca_weights.sum()
 pca_weight_corr = float(pca.components_[0, 0] ** 2 / (pca.components_[0, 0] ** 2 + pca.components_[0, 1] ** 2))
 pca_weight_takens = 1 - pca_weight_corr
 
-combined_signal = pca_weight_corr * norm_corr + pca_weight_takens * norm_takens
-signal_smooth = combined_signal.ewm(span=smoothing_span).mean()
+# Smoothed versions for plotting/alerts
+tda_signal_raw = pca_weight_corr * norm_corr + pca_weight_takens * norm_takens
+tda_signal_smooth = tda_signal_raw.ewm(span=smoothing_span).mean()
+shannon_smooth = norm_shannon.ewm(span=smoothing_span).mean()
+drift_smooth = drift_smooth if GTDA_AVAILABLE and len(drift) > 0 else pd.Series(dtype=float)
 
-signal_sharpe = float(combined_signal.mean() / combined_signal.std() * np.sqrt(252)) if combined_signal.std() > 0 else 0
-signal_strength = float(np.abs(combined_signal.mean()) / (combined_signal.std() + 1e-8))
+# Effective primary (fallback if drift unavailable)
+effective_primary = primary_signal
+if primary_signal == "Wasserstein" and (not GTDA_AVAILABLE or len(drift_smooth) == 0):
+    effective_primary = "TDA"
+    st.sidebar.warning("Wasserstein unavailable for current selection; falling back to TDA.")
 
-historical_threshold_val = signal_smooth.quantile(percentile_threshold / 100.0)
-threshold_series = pd.Series(historical_threshold_val, index=signal_smooth.index)
+# Select which signal drives alarms/validation/optimization
+if effective_primary == "TDA":
+    active_display_signal = tda_signal_smooth
+    active_threshold_signal = tda_signal_smooth
+    active_label = "TDA Entropy"
+elif effective_primary == "Shannon":
+    active_display_signal = shannon_smooth
+    active_threshold_signal = shannon_smooth
+    active_label = "Shannon Entropy"
+elif effective_primary == "Wasserstein" and GTDA_AVAILABLE and len(drift_smooth) > 0:
+    active_display_signal = drift_smooth
+    active_threshold_signal = -drift_smooth  # invert so low values still mean worse for threshold logic
+    active_label = "Wasserstein Drift"
+else:
+    active_display_signal = tda_signal_smooth
+    active_threshold_signal = tda_signal_smooth
+    active_label = "TDA Entropy"
 
-view_signal = signal_smooth
+signal_sharpe = float(active_display_signal.mean() / active_display_signal.std() * np.sqrt(252)) if active_display_signal.std() > 0 else 0
+signal_strength = float(np.abs(active_display_signal.mean()) / (active_display_signal.std() + 1e-8))
+
+historical_threshold_val = active_threshold_signal.quantile(percentile_threshold / 100.0)
+threshold_series = pd.Series(historical_threshold_val, index=active_threshold_signal.index)
+
+view_signal = active_display_signal
 view_threshold = threshold_series
 view_sp500 = sp500_price.loc[view_signal.index]
 
@@ -583,10 +617,11 @@ if len(view_signal) == 0:
     st.error("No data in selected range")
     st.stop()
 
-latest_val = float(view_signal.iloc[-1])
+latest_val = float(active_threshold_signal.iloc[-1])
+display_val = float(view_signal.iloc[-1])
 
-rolling_mean = view_signal.rolling(ROLLING_WINDOW_DAYS).mean().iloc[-1]
-rolling_std = view_signal.rolling(ROLLING_WINDOW_DAYS).std().iloc[-1]
+rolling_mean = active_threshold_signal.rolling(ROLLING_WINDOW_DAYS).mean().iloc[-1]
+rolling_std = active_threshold_signal.rolling(ROLLING_WINDOW_DAYS).std().iloc[-1]
 z_score = (latest_val - rolling_mean) / (rolling_std + 1e-8) if rolling_std > 0 else 0
 
 price_trend_5d = view_sp500.pct_change(5).iloc[-1]
@@ -636,27 +671,33 @@ else:
 tab1, tab2, tab3, tab4 = st.tabs(["Signal", "Inspector", "Validation", "Optimization"])
 
 with tab1:
-    drift_msg = " **Wasserstein Drift** (cyan) measures the speed of structural change—high drift indicates violent reorganization (shocks)." if GTDA_AVAILABLE else ""
+    drift_msg = " **Wasserstein Drift** (cyan) measures the speed of structural change." if GTDA_AVAILABLE else ""
     st.info(f"📊 **Signal Methodology:** This dashboard analyzes market entropy using topological data analysis (TDA). The combined signal uses: (1) **Topological Entropy** from 11 SPDR sector correlation structure (measures systemic connectivity), (2) **Takens Embedding Entropy** from S&P 500 price dynamics (measures attractor complexity). **Shannon Entropy** (purple line) is shown for reference to compare structural topology vs. return distribution chaos.{drift_msg} Entropy and drift are visualization aids; alerts are based on topological entropy.")
     
     c1, c2, c3 = st.columns(3)
     c1.metric("Status", status, msg, delta_color=color)
-    c2.metric("TDA Structural Entropy (Z-score)", f"{latest_val:.2f}", f"Z-score: {z_score:.2f}")
+    c2.metric(f"{active_label} (Z-score)", f"{display_val:.2f}", f"Z-score: {z_score:.2f}")
     c3.metric("Risk Level", f"{risk_level}/5", "Multi-factor Risk Score")
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     
-    # Main entropy signals
+    # Optional overlays (default to primary only)
+    show_tda = st.checkbox("Show TDA", value=effective_primary == "TDA")
+    show_shannon = st.checkbox("Show Shannon", value=effective_primary == "Shannon")
+    show_drift = st.checkbox("Show Wasserstein", value=(effective_primary == "Wasserstein" and GTDA_AVAILABLE and len(drift) > 0))
+    
     view_corr = norm_corr.loc[view_signal.index]
     view_shannon = norm_shannon.loc[view_signal.index]
-    fig.add_trace(go.Scatter(x=view_corr.index, y=view_corr, name="TDA Entropy", line=dict(color='#00ff00', width=2)), secondary_y=False)
-    fig.add_trace(go.Scatter(x=view_shannon.index, y=view_shannon, name="Shannon Entropy", line=dict(color='rgba(189,0,255,0.4)', width=1.5)), secondary_y=False)
+    if show_tda:
+        fig.add_trace(go.Scatter(x=view_corr.index, y=view_corr, name="TDA Entropy", line=dict(color='#00ff00', width=2)), secondary_y=False)
+    if show_shannon:
+        fig.add_trace(go.Scatter(x=view_shannon.index, y=view_shannon, name="Shannon Entropy", line=dict(color='rgba(189,0,255,0.4)', width=1.5)), secondary_y=False)
     
-    # Drift if available
-    if GTDA_AVAILABLE and 'drift' in locals() and len(drift) > 0:
+    if show_drift and GTDA_AVAILABLE and 'drift' in locals() and len(drift) > 0:
         view_drift = norm_drift.loc[view_signal.index]
         fig.add_trace(go.Scatter(x=view_drift.index, y=view_drift, name="Wasserstein Drift", line=dict(color='rgba(0,212,255,0.6)', width=1.5)), secondary_y=False)
     
+    # Active threshold
     fig.add_trace(go.Scatter(x=view_threshold.index, y=view_threshold, name="Threshold", line=dict(color='red', dash='dot')), secondary_y=False)
     
     # S&P 500 price
@@ -724,11 +765,14 @@ with tab1:
         )
     
     with col3:
-        st.metric(
-            "PCA Weights",
-            f"TDA:{pca_weight_corr:.0%} / Tak:{pca_weight_takens:.0%}",
-            help="PCA weights: TDA/Takens"
-        )
+        if primary_signal == "TDA":
+            st.metric(
+                "PCA Weights",
+                f"TDA:{pca_weight_corr:.0%} / Tak:{pca_weight_takens:.0%}",
+                help="PCA weights: TDA/Takens"
+            )
+        else:
+            st.metric("PCA Weights", "N/A", help="Only applicable for TDA primary")
     
     with col4:
         st.metric(
@@ -897,9 +941,10 @@ with tab2:
             ))
             heatmap_fig.update_layout(
                 template="plotly_dark",
-                height=400,
+                height=360,
                 xaxis=dict(side='bottom'),
-                yaxis=dict(autorange='reversed')
+                yaxis=dict(autorange='reversed'),
+                margin=dict(t=30, b=20, l=10, r=10)
             )
             st.plotly_chart(heatmap_fig, use_container_width=True)
         
@@ -918,7 +963,8 @@ with tab2:
                 takens_fig.update_layout(
                     template="plotly_dark", 
                     scene=dict(xaxis_title="t", yaxis_title="t-1", zaxis_title="t-2"),
-                    height=400
+                    height=360,
+                    margin=dict(t=30, b=20, l=0, r=0)
                 )
                 st.plotly_chart(takens_fig, use_container_width=True)
         
@@ -1026,6 +1072,7 @@ with tab2:
 
 with tab3:
     st.header("🔬 Signal Validation")
+    st.caption(f"Validating primary signal: {active_label}")
     
     st.warning("⚠️ **Disclaimer:** All backtested results are hypothetical and do not reflect actual trading. Analysis excludes transaction costs, slippage, and market impact. Past performance does not guarantee future results.")
     
@@ -1036,8 +1083,8 @@ with tab3:
     
     with st.spinner("Running validation tests..."):
             validator = EntropyValidator(
-                signal=signal_smooth,
-                prices=sp500_price_full.loc[signal_smooth.index],
+                signal=active_threshold_signal,
+                prices=sp500_price_full.loc[active_threshold_signal.index],
                 threshold=historical_threshold_val
             )
             
@@ -1310,12 +1357,14 @@ with tab4:
             """
         )
         
+        trading_default = "Short (Risk-Off)" if effective_primary == "Wasserstein" else "Long (Contrarian)"
         trading_direction = st.radio(
             "Trading Direction",
             ["Long (Contrarian)", "Short (Risk-Off)"],
+            index=["Long (Contrarian)", "Short (Risk-Off)"].index(trading_default),
             help="""
-            **Long**: Buy when TDA entropy is low
-            **Short**: Sell/short when TDA entropy is low
+            **Long**: Buy when signal is low (contrarian)
+            **Short**: Sell/short when signal indicates stress (default for Wasserstein)
             """
         )
         
@@ -1331,13 +1380,20 @@ with tab4:
         col2a, col2b = st.columns(2)
         
         with col2a:
+            if primary_signal == "Wasserstein":
+                window_default = (60, 110)
+                smooth_default = (10, 25)
+            else:
+                window_default = (40, 100)
+                smooth_default = (5, 20)
+
             window_min, window_max = st.slider(
-                "Window Size Range", 20, 120, (40, 100), 10,
-                help="Lookback period for correlations"
+                "Window Size Range", 20, 140, window_default, 10,
+                help="Lookback period"
             )
             
             smooth_min, smooth_max = st.slider(
-                "Smoothing Range", 1, 30, (5, 20), 5,
+                "Smoothing Range", 1, 40, smooth_default, 5,
                 help="EMA smoothing span"
             )
         
@@ -1398,15 +1454,34 @@ with tab4:
     st.markdown("---")
     
     if st.button("▶️ Run Optimization", type="primary"):
+        if effective_primary == "Shannon":
+            st.error("Optimization for Shannon entropy is not supported. Please choose TDA or Wasserstein.")
+            st.stop()
         
         with st.spinner("Running optimization... This may take several minutes."):
             
-            optimizer = EntropyOptimizer(
-                mag7_returns=mag7_returns_full,
-                sp500_price=sp500_price_full,
-                run_tda_pipeline=run_tda_pipeline,
-                run_takens_pipeline=run_takens_pipeline
-            )
+            if effective_primary == "Wasserstein" and GTDA_AVAILABLE:
+                def inverted_drift_pipeline(log_returns, window_size):
+                    d = run_drift_pipeline(log_returns, window_size, stride=1)
+                    return -d  # invert so threshold logic (low=alert) still applies
+                optimizer = EntropyOptimizer(
+                    mag7_returns=mag7_returns_full,
+                    sp500_price=sp500_price_full,
+                    run_tda_pipeline=inverted_drift_pipeline,
+                    run_takens_pipeline=lambda *args, **kwargs: pd.Series(dtype=float)
+                )
+                # Force drift-only weighting
+                param_grid['corr_weight'] = [1.0]
+            elif primary_signal == "Shannon":
+                st.error("Optimization for Shannon entropy not supported in this release.")
+                st.stop()
+            else:
+                optimizer = EntropyOptimizer(
+                    mag7_returns=mag7_returns_full,
+                    sp500_price=sp500_price_full,
+                    run_tda_pipeline=run_tda_pipeline,
+                    run_takens_pipeline=run_takens_pipeline
+                )
             
             direction = 'long' if trading_direction == "Long (Contrarian)" else 'short'
             
@@ -1461,15 +1536,22 @@ with tab4:
                 'sharpe', 'annual_return', 'max_drawdown', 'win_rate', 
                 'pct_invested', 'num_trades'
             ]
-            
-            top_10 = results_df.head(10)[display_cols].copy()
-            
-            top_10['sharpe'] = top_10['sharpe'].apply(lambda x: f"{x:.3f}")
-            top_10['annual_return'] = top_10['annual_return'].apply(lambda x: f"{x*100:.2f}%")
-            top_10['max_drawdown'] = top_10['max_drawdown'].apply(lambda x: f"{x*100:.2f}%")
-            top_10['win_rate'] = top_10['win_rate'].apply(lambda x: f"{x*100:.1f}%")
-            top_10['pct_invested'] = top_10['pct_invested'].apply(lambda x: f"{x*100:.1f}%")
-            top_10['corr_weight'] = top_10['corr_weight'].apply(lambda x: x if x == 'pca' else f"{x:.1%}")
+
+            available_cols = [c for c in display_cols if c in results_df.columns]
+            top_10 = results_df.head(10)[available_cols].copy()
+
+            if 'sharpe' in top_10.columns:
+                top_10['sharpe'] = top_10['sharpe'].apply(lambda x: f"{x:.3f}")
+            if 'annual_return' in top_10.columns:
+                top_10['annual_return'] = top_10['annual_return'].apply(lambda x: f"{x*100:.2f}%")
+            if 'max_drawdown' in top_10.columns:
+                top_10['max_drawdown'] = top_10['max_drawdown'].apply(lambda x: f"{x*100:.2f}%")
+            if 'win_rate' in top_10.columns:
+                top_10['win_rate'] = top_10['win_rate'].apply(lambda x: f"{x*100:.1f}%")
+            if 'pct_invested' in top_10.columns:
+                top_10['pct_invested'] = top_10['pct_invested'].apply(lambda x: f"{x*100:.1f}%")
+            if 'corr_weight' in top_10.columns:
+                top_10['corr_weight'] = top_10['corr_weight'].apply(lambda x: x if x == 'pca' else f"{x:.1%}")
             
             st.dataframe(top_10, use_container_width=True)
             
@@ -1485,11 +1567,11 @@ with tab4:
             
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Sharpe", f"{best['sharpe']:.3f}", 
-                       delta=f"{best['sharpe'] - best['bh_sharpe']:.3f}")
+                       delta=f"{(best['sharpe'] - best['bh_sharpe']):.3f}" if 'bh_sharpe' in best else None)
             col2.metric("Annual Return", f"{best['annual_return']*100:.2f}%",
-                       delta=f"{(best['annual_return'] - best['bh_annual_return'])*100:.2f}%")
-            col3.metric("Max DD", f"{best['max_drawdown']*100:.2f}%")
-            col4.metric("Win Rate", f"{best['win_rate']*100:.1f}%")
+                       delta=f"{(best['annual_return'] - best['bh_annual_return'])*100:.2f}%" if 'bh_annual_return' in best else None)
+            col3.metric("Max DD", f"{best['max_drawdown']*100:.2f}%" if 'max_drawdown' in best else "N/A")
+            col4.metric("Win Rate", f"{best['win_rate']*100:.1f}%" if 'win_rate' in best else "N/A")
             
             if 'optimizer' in st.session_state:
                 optimizer = st.session_state['optimizer']
