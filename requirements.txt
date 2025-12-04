@@ -3,5 +3,5 @@ yfinance
 pandas
 numpy
 plotly
-giotto-tda
+giotto-tda==0.5.1
 scikit-learn
