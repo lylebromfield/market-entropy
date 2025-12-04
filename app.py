@@ -32,14 +32,22 @@ st.markdown("""
 
 @st.cache_data(ttl=3600)
 def fetch_market_data(tickers, benchmark_ticker):
-    data = yf.download(tickers, start="2000-01-01", interval="1d", auto_adjust=True)['Close']
-    mag7_returns = np.log(data / data.shift(1)).dropna()
-    
-    sp500 = yf.download(benchmark_ticker, start="2000-01-01", interval="1d", auto_adjust=True)['Close']
-    if isinstance(sp500, pd.DataFrame):
-        sp500 = sp500.squeeze()
+    try:
+        data = yf.download(tickers, start="2000-01-01", interval="1d", auto_adjust=True, group_by='column', progress=False)
+        if 'Close' in data.columns:
+            data = data['Close']
+        mag7_returns = np.log(data / data.shift(1)).dropna()
         
-    return mag7_returns, sp500
+        sp500 = yf.download(benchmark_ticker, start="2000-01-01", interval="1d", auto_adjust=True, progress=False)
+        if 'Close' in sp500.columns:
+            sp500 = sp500['Close']
+        if isinstance(sp500, pd.DataFrame):
+            sp500 = sp500.squeeze()
+            
+        return mag7_returns, sp500
+    except Exception as e:
+        st.error(f"Error fetching data: {str(e)}")
+        return pd.DataFrame(), pd.Series(dtype=float)
 
 @st.cache_data
 def run_tda_pipeline(log_returns, window_size, stride=1):
@@ -152,6 +160,10 @@ st.title("Market Entropy")
 with st.spinner(f"Computing topology..."):
     tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA']
     mag7_returns, sp500_price = fetch_market_data(tickers, "^GSPC")
+    
+    if len(mag7_returns) == 0 or len(sp500_price) == 0:
+        st.error("Failed to fetch market data. Please check your internet connection and try again.")
+        st.stop()
     
     # Ensure dates are timezone-aware if needed
     if mag7_returns.index.tz is not None:
