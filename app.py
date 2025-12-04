@@ -15,6 +15,12 @@ try:
     GTDA_AVAILABLE = True
 except ImportError:
     GTDA_AVAILABLE = False
+try:
+    from persim import wasserstein
+    PERSIM_AVAILABLE = True
+except ImportError:
+    PERSIM_AVAILABLE = False
+DRIFT_AVAILABLE = GTDA_AVAILABLE or PERSIM_AVAILABLE
 from typing import Tuple, Optional
 from validation_module import EntropyValidator, create_validation_plots
 from optimizer_module import EntropyOptimizer
@@ -329,84 +335,75 @@ def _run_shannon_pipeline_impl(price_series: pd.Series, window_size: int, stride
 @st.cache_data
 def run_drift_pipeline(log_returns: pd.DataFrame, window_size: int, stride: int = 1) -> pd.Series:
     """
-    Compute Wasserstein drift (topological speed) using giotto-tda.
-    
-    Measures the rate of change in market structure by comparing
-    persistence diagrams at time T vs T-1. High drift indicates
-    violent structural change (shocks), low drift indicates stable structure.
-    
-    Args:
-        log_returns: DataFrame of log returns
-        window_size: Sliding window size in days
-        stride: Step size between windows
-    
-    Returns:
-        Series of drift values indexed by dates
+    Compute Wasserstein drift (topological speed).
+
+    Prefers giotto-tda when available; otherwise falls back to
+    ripser+persim Wasserstein between consecutive diagrams.
     """
-    if not GTDA_AVAILABLE:
-        st.warning("giotto-tda not available. Drift calculation disabled.")
+    if not DRIFT_AVAILABLE:
+        st.warning("Wasserstein drift unavailable (missing giotto-tda or persim).")
         return pd.Series(dtype=float)
-    
+
     data_hash = _compute_data_hash(log_returns)
     return _run_drift_pipeline_impl(log_returns, window_size, stride, data_hash)
 
 @st.cache_data
 def _run_drift_pipeline_impl(log_returns: pd.DataFrame, window_size: int, stride: int, _data_hash: int) -> pd.Series:
-    """
-    Implementation of Wasserstein drift computation.
-    
-    1. Generate distance matrices for all windows
-    2. Compute persistence diagrams using Vietoris-Rips
-    3. Calculate amplitude (structural magnitude) of each diagram
-    4. Measure drift as absolute change in amplitude
-    
-    Args:
-        log_returns: DataFrame of log returns
-        window_size: Window size in days
-        stride: Step size between windows
-        _data_hash: Cache key
-    
-    Returns:
-        Series of drift values
-    """
+    """Implementation of Wasserstein drift computation with dual backends."""
     n_samples = len(log_returns)
-    distance_matrices = []
     dates = []
-    
+    diagrams = []
+
     progress_bar = st.progress(0, text="Computing topological drift...")
-    
-    # Generate distance matrices for all windows
+
+    # Build diagrams for each window
     for i in range(window_size, n_samples):
         window_data = log_returns.iloc[i-window_size:i]
         corr_matrix = window_data.corr().values
         dist_matrix = CORRELATION_DISTANCE_COEFFICIENT * np.sqrt(1 - corr_matrix)
         np.fill_diagonal(dist_matrix, 0)
-        distance_matrices.append(dist_matrix)
+
+        if GTDA_AVAILABLE:
+            # giotto-tda path
+            if 'vr' not in locals():
+                vr = VietorisRipsPersistence(metric="precomputed", homology_dimensions=[0, 1, 2], n_jobs=-1)
+            diag = vr.fit_transform(np.array([dist_matrix]))[0]
+        else:
+            # ripser distance-matrix path
+            diag = ripser(dist_matrix, maxdim=2, distance_matrix=True)['dgms']
+        diagrams.append(diag)
         dates.append(log_returns.index[i])
-        
+
         if i % max(1, (n_samples - window_size) // 20) == 0:
             progress_bar.progress(min((i - window_size) / (n_samples - window_size), PROGRESS_BAR_MAX), text="Computing topological drift...")
-    
-    if len(distance_matrices) < 2:
+
+    if len(diagrams) < 2:
         progress_bar.empty()
-        return pd.Series(0, index=dates)
-    
-    # Compute persistence diagrams
-    vr = VietorisRipsPersistence(metric="precomputed", homology_dimensions=[0, 1, 2], n_jobs=-1)
-    diagrams = vr.fit_transform(np.array(distance_matrices))
-    
-    # Calculate amplitude (structural magnitude)
-    amp = Amplitude(metric='wasserstein', n_jobs=-1)
-    amplitudes = amp.fit_transform(diagrams)
-    
-    # Sum amplitudes across dimensions
-    total_amp = np.sum(amplitudes, axis=1)
-    
-    # Drift = absolute change in structural magnitude
-    drift = np.abs(np.diff(total_amp, prepend=total_amp[0]))
-    
+        return pd.Series(dtype=float)
+
+    if GTDA_AVAILABLE:
+        # giotto amplitude approach
+        amp = Amplitude(metric='wasserstein', n_jobs=-1)
+        amplitudes = amp.fit_transform(np.array(diagrams))
+        total_amp = np.sum(amplitudes, axis=1)
+        drift = np.abs(np.diff(total_amp, prepend=total_amp[0]))
+    else:
+        # persim wasserstein distance between consecutive diagrams per homology dim
+        drift = [0.0]
+        for idx in range(1, len(diagrams)):
+            prev = diagrams[idx - 1]
+            curr = diagrams[idx]
+            dist_sum = 0.0
+            for dim in range(min(len(prev), len(curr))):
+                try:
+                    dist_sum += float(wasserstein(curr[dim], prev[dim]))
+                except Exception:
+                    dist_sum += 0.0
+            drift.append(dist_sum)
+        drift = np.array(drift)
+
     drift_series = pd.Series(drift, index=dates)
-    
+
     progress_bar.empty()
     return drift_series.iloc[::stride]
 
@@ -445,8 +442,8 @@ def get_snapshot_topology(log_returns: pd.DataFrame, target_date: pd.Timestamp,
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    signal_options = ["TDA", "Shannon"] + (["Wasserstein"] if GTDA_AVAILABLE else [])
-    default_index = signal_options.index("Wasserstein") if GTDA_AVAILABLE else 0
+    signal_options = ["TDA", "Shannon"] + (["Wasserstein"] if DRIFT_AVAILABLE else [])
+    default_index = signal_options.index("Wasserstein") if DRIFT_AVAILABLE else 0
     primary_signal = st.radio(
         "Primary Signal",
         signal_options,
@@ -509,8 +506,8 @@ corr_entropy_full = run_tda_pipeline(mag7_returns_full, window_size)
 takens_entropy_full = run_takens_pipeline(sp500_price_full, window_size, stride=1, dimension=takens_dimension, delay=takens_delay)
 shannon_entropy_full = run_shannon_pipeline(sp500_price_full, window_size, stride=1)
 
-# Compute Wasserstein drift if giotto-tda is available
-if GTDA_AVAILABLE:
+# Compute Wasserstein drift if available
+if DRIFT_AVAILABLE:
     drift_full = run_drift_pipeline(mag7_returns_full, window_size, stride=1)
 else:
     drift_full = pd.Series(dtype=float)
@@ -519,7 +516,7 @@ if len(corr_entropy_full) == 0 or len(takens_entropy_full) == 0 or len(shannon_e
     st.error("Insufficient data for TDA computation")
     st.stop()
 
-if GTDA_AVAILABLE and len(drift_full) > 0:
+if DRIFT_AVAILABLE and len(drift_full) > 0:
     common_start = max(corr_entropy_full.index[0], takens_entropy_full.index[0], shannon_entropy_full.index[0], drift_full.index[0], start_date)
     common_end = min(corr_entropy_full.index[-1], takens_entropy_full.index[-1], shannon_entropy_full.index[-1], drift_full.index[-1], end_date)
 else:
@@ -532,7 +529,7 @@ corr_entropy = corr_entropy_full.loc[common_start:common_end]
 takens_entropy = takens_entropy_full.loc[common_start:common_end]
 shannon_entropy = shannon_entropy_full.loc[common_start:common_end]
 
-if GTDA_AVAILABLE and len(drift_full) > 0:
+if DRIFT_AVAILABLE and len(drift_full) > 0:
     drift = drift_full.loc[common_start:common_end]
 else:
     drift = pd.Series(dtype=float)
@@ -546,7 +543,7 @@ if len(corr_entropy) == 0 or len(takens_entropy) == 0 or len(shannon_entropy) ==
     st.stop()
 
 # Processing
-if GTDA_AVAILABLE and len(drift) > 0:
+if DRIFT_AVAILABLE and len(drift) > 0:
     common_index = corr_entropy.index.intersection(takens_entropy.index).intersection(shannon_entropy.index).intersection(drift.index)
     drift = drift.loc[common_index]
     drift_smooth = drift.ewm(span=smoothing_span).mean()
@@ -577,11 +574,11 @@ pca_weight_takens = 1 - pca_weight_corr
 tda_signal_raw = pca_weight_corr * norm_corr + pca_weight_takens * norm_takens
 tda_signal_smooth = tda_signal_raw.ewm(span=smoothing_span).mean()
 shannon_smooth = norm_shannon.ewm(span=smoothing_span).mean()
-drift_smooth = drift_smooth if GTDA_AVAILABLE and len(drift) > 0 else pd.Series(dtype=float)
+drift_smooth = drift_smooth if DRIFT_AVAILABLE and len(drift) > 0 else pd.Series(dtype=float)
 
 # Effective primary (fallback if drift unavailable)
 effective_primary = primary_signal
-if primary_signal == "Wasserstein" and (not GTDA_AVAILABLE or len(drift_smooth) == 0):
+if primary_signal == "Wasserstein" and (not DRIFT_AVAILABLE or len(drift_smooth) == 0):
     effective_primary = "TDA"
     st.sidebar.warning("Wasserstein unavailable for current selection; falling back to TDA.")
 
@@ -594,7 +591,7 @@ elif effective_primary == "Shannon":
     active_display_signal = shannon_smooth
     active_threshold_signal = shannon_smooth
     active_label = "Shannon Entropy"
-elif effective_primary == "Wasserstein" and GTDA_AVAILABLE and len(drift_smooth) > 0:
+elif effective_primary == "Wasserstein" and DRIFT_AVAILABLE and len(drift_smooth) > 0:
     active_display_signal = drift_smooth
     active_threshold_signal = -drift_smooth  # invert so low values still mean worse for threshold logic
     active_label = "Wasserstein Drift"
@@ -671,7 +668,7 @@ else:
 tab1, tab2, tab3, tab4 = st.tabs(["Signal", "Inspector", "Validation", "Optimization"])
 
 with tab1:
-    drift_msg = " **Wasserstein Drift** (cyan) measures the speed of structural change." if GTDA_AVAILABLE else ""
+    drift_msg = " **Wasserstein Drift** (cyan) measures the speed of structural change." if DRIFT_AVAILABLE else ""
     st.info(f"📊 **Signal Methodology:** This dashboard analyzes market entropy using topological data analysis (TDA). The combined signal uses: (1) **Topological Entropy** from 11 SPDR sector correlation structure (measures systemic connectivity), (2) **Takens Embedding Entropy** from S&P 500 price dynamics (measures attractor complexity). **Shannon Entropy** (purple line) is shown for reference to compare structural topology vs. return distribution chaos.{drift_msg} Entropy and drift are visualization aids; alerts are based on topological entropy.")
     
     c1, c2, c3 = st.columns(3)
@@ -684,7 +681,7 @@ with tab1:
     # Optional overlays (default to primary only)
     show_tda = st.checkbox("Show TDA", value=effective_primary == "TDA")
     show_shannon = st.checkbox("Show Shannon", value=effective_primary == "Shannon")
-    show_drift = st.checkbox("Show Wasserstein", value=(effective_primary == "Wasserstein" and GTDA_AVAILABLE and len(drift) > 0))
+    show_drift = st.checkbox("Show Wasserstein", value=(effective_primary == "Wasserstein" and DRIFT_AVAILABLE and len(drift) > 0))
     
     view_corr = norm_corr.loc[view_signal.index]
     view_shannon = norm_shannon.loc[view_signal.index]
@@ -693,7 +690,7 @@ with tab1:
     if show_shannon:
         fig.add_trace(go.Scatter(x=view_shannon.index, y=view_shannon, name="Shannon Entropy", line=dict(color='rgba(189,0,255,0.4)', width=1.5)), secondary_y=False)
     
-    if show_drift and GTDA_AVAILABLE and 'drift' in locals() and len(drift) > 0:
+    if show_drift and DRIFT_AVAILABLE and 'drift' in locals() and len(drift) > 0:
         view_drift = norm_drift.loc[view_signal.index]
         fig.add_trace(go.Scatter(x=view_drift.index, y=view_drift, name="Wasserstein Drift", line=dict(color='rgba(0,212,255,0.6)', width=1.5)), secondary_y=False)
     
@@ -726,7 +723,7 @@ with tab1:
         )
     
     with col3:
-        if GTDA_AVAILABLE and len(drift) > 0:
+        if DRIFT_AVAILABLE and len(drift) > 0:
             drift_percentile = (drift_smooth <= drift_smooth.iloc[-1]).sum() / len(drift_smooth) * 100
             st.metric(
                 "Wasserstein Drift",
@@ -1460,7 +1457,7 @@ with tab4:
         
         with st.spinner("Running optimization... This may take several minutes."):
             
-            if effective_primary == "Wasserstein" and GTDA_AVAILABLE:
+            if effective_primary == "Wasserstein" and DRIFT_AVAILABLE:
                 def inverted_drift_pipeline(log_returns, window_size):
                     d = run_drift_pipeline(log_returns, window_size, stride=1)
                     return -d  # invert so threshold logic (low=alert) still applies
