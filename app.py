@@ -4,9 +4,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from gtda.homology import VietorisRipsPersistence
-from gtda.diagrams import PersistenceEntropy
-from gtda.time_series import SingleTakensEmbedding
+from ripser import ripser
 from sklearn.manifold import MDS
 
 st.set_page_config(
@@ -46,7 +44,7 @@ def fetch_market_data(tickers, benchmark_ticker):
 @st.cache_data
 def run_tda_pipeline(log_returns, window_size, stride=1):
     n_samples = len(log_returns)
-    distance_matrices = []
+    entropies = []
     dates = []
     
     for i in range(window_size, n_samples, stride):
@@ -54,41 +52,61 @@ def run_tda_pipeline(log_returns, window_size, stride=1):
         corr_matrix = window_data.corr().values
         dist_matrix = np.sqrt(2 * (1 - corr_matrix))
         np.fill_diagonal(dist_matrix, 0)
-        distance_matrices.append(dist_matrix)
-        dates.append(log_returns.index[i])
         
-    vr = VietorisRipsPersistence(metric="precomputed", homology_dimensions=[0, 1, 2], n_jobs=-1)
-    diagrams = vr.fit_transform(np.array(distance_matrices))
+        result = ripser(dist_matrix, maxdim=2, distance_matrix=True)
+        diagrams = result['dgms']
+        
+        entropy = 0
+        for dim_diagram in diagrams:
+            if len(dim_diagram) > 0:
+                births = dim_diagram[:, 0]
+                deaths = dim_diagram[:, 1]
+                lifetimes = deaths - births
+                lifetimes = lifetimes[np.isfinite(lifetimes) & (lifetimes > 0)]
+                if len(lifetimes) > 0:
+                    lifetimes_norm = lifetimes / lifetimes.sum()
+                    entropy -= np.sum(lifetimes_norm * np.log(lifetimes_norm + 1e-16))
+        
+        entropies.append(entropy)
+        dates.append(log_returns.index[i])
     
-    pe = PersistenceEntropy(n_jobs=-1)
-    entropy_features = pe.fit_transform(diagrams)
-    total_entropy = np.sum(entropy_features, axis=1)
-    
-    return pd.Series(total_entropy, index=dates)
+    return pd.Series(entropies, index=dates)
 
 @st.cache_data
 def run_takens_pipeline(price_series, window_size, stride=1, dimension=3, delay=1):
     returns = np.log(price_series / price_series.shift(1)).dropna()
     n_samples = len(returns)
-    point_clouds = []
+    entropies = []
     dates = []
-    
-    embedder = SingleTakensEmbedding(parameters_type="fixed", dimension=dimension, time_delay=delay)
     
     for i in range(window_size, n_samples, stride):
         window_data = returns.iloc[i-window_size:i].values
-        embedded_window = embedder.fit_transform(window_data)
-        point_clouds.append(embedded_window)
-        dates.append(returns.index[i])
         
-    vr = VietorisRipsPersistence(metric="euclidean", homology_dimensions=[0, 1], n_jobs=-1)
-    diagrams = vr.fit_transform(np.array(point_clouds))
+        # Takens embedding
+        embedded = []
+        for j in range(len(window_data) - (dimension - 1) * delay):
+            embedded.append([window_data[j + k * delay] for k in range(dimension)])
+        embedded = np.array(embedded)
+        
+        if len(embedded) > 1:
+            result = ripser(embedded, maxdim=1)
+            diagrams = result['dgms']
+            
+            entropy = 0
+            for dim_diagram in diagrams:
+                if len(dim_diagram) > 0:
+                    births = dim_diagram[:, 0]
+                    deaths = dim_diagram[:, 1]
+                    lifetimes = deaths - births
+                    lifetimes = lifetimes[np.isfinite(lifetimes) & (lifetimes > 0)]
+                    if len(lifetimes) > 0:
+                        lifetimes_norm = lifetimes / lifetimes.sum()
+                        entropy -= np.sum(lifetimes_norm * np.log(lifetimes_norm + 1e-16))
+            
+            entropies.append(entropy)
+            dates.append(returns.index[i])
     
-    pe = PersistenceEntropy(n_jobs=-1)
-    entropy_features = pe.fit_transform(diagrams)
-    total_entropy = np.sum(entropy_features, axis=1)
-    
-    return pd.Series(total_entropy, index=dates)
+    return pd.Series(entropies, index=dates)
 
 def get_snapshot_topology(log_returns, target_date, window_size, tickers):
     if target_date not in log_returns.index:
@@ -221,7 +239,7 @@ with tab1:
     fig.add_trace(go.Scatter(x=view_sp500.index, y=view_sp500, name="S&P 500", line=dict(color='rgba(255,255,255,0.2)')), secondary_y=True)
     
     fig.update_layout(template="plotly_dark", height=500, hovermode="x unified", legend=dict(orientation="h", y=1.02))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 with tab2:
     snap_date = st.select_slider("Date", options=view_signal.index, value=view_signal.index[-1], format_func=lambda x: x.strftime('%Y-%m-%d'))
@@ -241,7 +259,7 @@ with tab2:
                         mds_fig.add_trace(go.Scatter(x=[coords[i,0], coords[j,0]], y=[coords[i,1], coords[j,1]], 
                                                    mode='lines', line=dict(color=f'rgba(255,0,0,{corr.iloc[i,j]})', width=2), showlegend=False))
             mds_fig.update_layout(template="plotly_dark", showlegend=False, xaxis_visible=False, yaxis_visible=False)
-            st.plotly_chart(mds_fig, use_container_width=True)
+            st.plotly_chart(mds_fig, width='stretch')
         
         with c2:
             st.markdown("**Takens Attractor**")
@@ -256,4 +274,4 @@ with tab2:
                              colorbar=dict(title="Time"))
                 )])
                 takens_fig.update_layout(template="plotly_dark", scene=dict(xaxis_title="t", yaxis_title="t-1", zaxis_title="t-2"))
-                st.plotly_chart(takens_fig, use_container_width=True)
+                st.plotly_chart(takens_fig, width='stretch')

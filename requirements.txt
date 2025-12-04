@@ -3,6 +3,6 @@ yfinance
 pandas
 numpy
 plotly
-giotto-tda
+ripser
 scikit-learn
-Cython
+scipy
