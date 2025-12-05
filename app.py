@@ -13,17 +13,11 @@ import time
 import random
 import warnings
 try:
-    from gtda.homology import VietorisRipsPersistence
-    from gtda.diagrams import Amplitude
-    GTDA_AVAILABLE = True
-except ImportError:
-    GTDA_AVAILABLE = False
-try:
     from persim import wasserstein
     PERSIM_AVAILABLE = True
 except ImportError:
     PERSIM_AVAILABLE = False
-DRIFT_AVAILABLE = GTDA_AVAILABLE or PERSIM_AVAILABLE
+DRIFT_AVAILABLE = PERSIM_AVAILABLE
 from typing import Tuple, Optional
 from validation_module import EntropyValidator, create_validation_plots
 from optimizer_module import EntropyOptimizer
@@ -365,28 +359,21 @@ def run_drift_pipeline(log_returns: pd.DataFrame, window_size: int, stride: int 
 
 @st.cache_data
 def _run_drift_pipeline_impl(log_returns: pd.DataFrame, window_size: int, stride: int, _data_hash: int) -> pd.Series:
-    """Implementation of Wasserstein drift computation with dual backends."""
+    """Implementation of Wasserstein drift using ripser + persim."""
     n_samples = len(log_returns)
     dates = []
     diagrams = []
 
     progress_bar = st.progress(0, text="Computing topological drift...")
 
-    # Build diagrams for each window
+    # Build diagrams for each window using ripser
     for i in range(window_size, n_samples):
         window_data = log_returns.iloc[i-window_size:i]
         corr_matrix = window_data.corr().values
         dist_matrix = CORRELATION_DISTANCE_COEFFICIENT * np.sqrt(1 - corr_matrix)
         np.fill_diagonal(dist_matrix, 0)
 
-        if GTDA_AVAILABLE:
-            # giotto-tda path
-            if 'vr' not in locals():
-                vr = VietorisRipsPersistence(metric="precomputed", homology_dimensions=[0, 1, 2], n_jobs=-1)
-            diag = vr.fit_transform(np.array([dist_matrix]))[0]
-        else:
-            # ripser distance-matrix path
-            diag = ripser(dist_matrix, maxdim=2, distance_matrix=True)['dgms']
+        diag = ripser(dist_matrix, maxdim=2, distance_matrix=True)['dgms']
         diagrams.append(diag)
         dates.append(log_returns.index[i])
 
@@ -397,26 +384,18 @@ def _run_drift_pipeline_impl(log_returns: pd.DataFrame, window_size: int, stride
         progress_bar.empty()
         return pd.Series(dtype=float)
 
-    if GTDA_AVAILABLE:
-        # giotto amplitude approach
-        amp = Amplitude(metric='wasserstein', n_jobs=-1)
-        amplitudes = amp.fit_transform(np.array(diagrams))
-        total_amp = np.sum(amplitudes, axis=1)
-        drift = np.abs(np.diff(total_amp, prepend=total_amp[0]))
-    else:
-        # persim wasserstein distance between consecutive diagrams per homology dim
-        drift = [0.0]
-        for idx in range(1, len(diagrams)):
-            prev = diagrams[idx - 1]
-            curr = diagrams[idx]
-            dist_sum = 0.0
-            for dim in range(min(len(prev), len(curr))):
-                try:
-                    dist_sum += float(wasserstein(curr[dim], prev[dim]))
-                except Exception:
-                    dist_sum += 0.0
-            drift.append(dist_sum)
-        drift = np.array(drift)
+    # persim wasserstein distance between consecutive diagrams per homology dim
+    drift = [0.0]
+    for idx in range(1, len(diagrams)):
+        prev = diagrams[idx - 1]
+        curr = diagrams[idx]
+        dist_sum = 0.0
+        for dim in range(min(len(prev), len(curr))):
+            try:
+                dist_sum += float(wasserstein(curr[dim], prev[dim]))
+            except Exception:
+                dist_sum += 0.0
+        drift.append(dist_sum)
 
     drift_series = pd.Series(drift, index=dates)
 
@@ -481,10 +460,11 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("📅 Date Range")
-    min_year = 2000
+    # XLC (Communication Services) started June 2018, limiting historical data
+    min_year = 2018
     max_year = pd.Timestamp.now().year
     
-    date_range = st.slider("Years", min_year, max_year, (2018, max_year))
+    date_range = st.slider("Years", min_year, max_year, (min_year, max_year))
     start_date = pd.to_datetime(f"{date_range[0]}-01-01")
     end_date = pd.to_datetime(f"{date_range[1]}-12-31")
 
@@ -510,6 +490,10 @@ if len(mag7_returns_full) == 0 or len(sp500_price_full) == 0:
     st.error("Failed to fetch market data. Please check your internet connection and try again.")
     st.stop()
 
+# Show actual data range (limited by newest ETF - XLC started June 2018)
+data_start_year = mag7_returns_full.index[0].year
+data_end_year = mag7_returns_full.index[-1].year
+
 if mag7_returns_full.index.tz is not None:
     start_date = pd.Timestamp(start_date).tz_localize(mag7_returns_full.index.tz)
     end_date = pd.Timestamp(end_date).tz_localize(mag7_returns_full.index.tz)
@@ -518,20 +502,13 @@ common_index_full = mag7_returns_full.index.intersection(sp500_price_full.index)
 mag7_returns_full = mag7_returns_full.loc[common_index_full]
 sp500_price_full = sp500_price_full.loc[common_index_full]
 
-# Apply user date range before computations to keep plots aligned with slider
-user_start = max(start_date, mag7_returns_full.index[0], sp500_price_full.index[0])
-user_end = min(end_date, mag7_returns_full.index[-1], sp500_price_full.index[-1])
-
-mag7_returns_window = mag7_returns_full.loc[user_start:user_end]
-sp500_price_window = sp500_price_full.loc[user_start:user_end]
-
-corr_entropy_full = run_tda_pipeline(mag7_returns_window, window_size)
-takens_entropy_full = run_takens_pipeline(sp500_price_window, window_size, stride=1, dimension=takens_dimension, delay=takens_delay)
-shannon_entropy_full = run_shannon_pipeline(sp500_price_window, window_size, stride=1)
+corr_entropy_full = run_tda_pipeline(mag7_returns_full, window_size)
+takens_entropy_full = run_takens_pipeline(sp500_price_full, window_size, stride=1, dimension=takens_dimension, delay=takens_delay)
+shannon_entropy_full = run_shannon_pipeline(sp500_price_full, window_size, stride=1)
 
 # Compute Wasserstein drift if available
 if DRIFT_AVAILABLE:
-    drift_full = run_drift_pipeline(mag7_returns_window, window_size, stride=1)
+    drift_full = run_drift_pipeline(mag7_returns_full, window_size, stride=1)
 else:
     drift_full = pd.Series(dtype=float)
 
@@ -628,12 +605,13 @@ signal_strength = float(np.abs(active_display_signal.mean()) / (active_display_s
 
 historical_threshold_val = active_threshold_signal.quantile(percentile_threshold / 100.0)
 threshold_series = pd.Series(historical_threshold_val, index=active_threshold_signal.index)
-# Apply sidebar date range filter to all view series
-date_mask = (active_display_signal.index >= start_date) & (active_display_signal.index <= end_date)
-view_signal = active_display_signal.loc[date_mask]
-view_threshold = threshold_series.loc[date_mask]
-view_sp500 = sp500_price.loc[view_signal.index]
-view_threshold_signal = active_threshold_signal.loc[date_mask]
+
+# Data is already filtered to start_date:end_date via common_start/common_end
+# Use the full filtered signal directly for views
+view_signal = active_display_signal
+view_threshold = threshold_series
+view_sp500 = sp500_price.reindex(view_signal.index)
+view_threshold_signal = active_threshold_signal
 
 if len(view_signal) == 0:
     st.error("No data in selected range")
@@ -696,6 +674,9 @@ with tab1:
     drift_msg = " **Wasserstein Drift** (cyan) measures the speed of structural change." if DRIFT_AVAILABLE else ""
     st.info(f"📊 **Signal Methodology:** This dashboard analyzes market entropy using topological data analysis (TDA). The combined signal uses: (1) **Topological Entropy** from 11 SPDR sector correlation structure (measures systemic connectivity), (2) **Takens Embedding Entropy** from S&P 500 price dynamics (measures attractor complexity). **Shannon Entropy** (purple line) is shown for reference to compare structural topology vs. return distribution chaos.{drift_msg} Entropy and drift are visualization aids; alerts are based on topological entropy.")
     
+    # Debug: show actual date range being displayed
+    st.caption(f"Displaying: {view_signal.index[0].strftime('%Y-%m-%d')} to {view_signal.index[-1].strftime('%Y-%m-%d')} ({len(view_signal)} points)")
+    
     c1, c2, c3 = st.columns(3)
     c1.metric("Status", status, msg, delta_color=color)
     c2.metric(f"{active_label} (Z-score)", f"{display_val:.2f}", f"Z-score: {z_score:.2f}")
@@ -726,7 +707,7 @@ with tab1:
     fig.add_trace(go.Scatter(x=view_sp500.index, y=view_sp500, name="S&P 500", line=dict(color='rgba(255,255,255,0.2)')), secondary_y=True)
     
     fig.update_layout(template="plotly_dark", height=500, hovermode="x unified", legend=dict(orientation="h", y=1.02))
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, use_container_width=True, key=f"main_chart_{date_range[0]}_{date_range[1]}")
     
     st.markdown("---")
     st.subheader("📊 Signal Analysis")
@@ -1105,8 +1086,8 @@ with tab3:
     
     with st.spinner("Running validation tests..."):
             validator = EntropyValidator(
-                signal=active_threshold_signal,
-                prices=sp500_price_full.loc[active_threshold_signal.index],
+                signal=view_threshold_signal,
+                prices=view_sp500,
                 threshold=historical_threshold_val
             )
             
