@@ -518,13 +518,20 @@ common_index_full = mag7_returns_full.index.intersection(sp500_price_full.index)
 mag7_returns_full = mag7_returns_full.loc[common_index_full]
 sp500_price_full = sp500_price_full.loc[common_index_full]
 
-corr_entropy_full = run_tda_pipeline(mag7_returns_full, window_size)
-takens_entropy_full = run_takens_pipeline(sp500_price_full, window_size, stride=1, dimension=takens_dimension, delay=takens_delay)
-shannon_entropy_full = run_shannon_pipeline(sp500_price_full, window_size, stride=1)
+# Apply user date range before computations to keep plots aligned with slider
+user_start = max(start_date, mag7_returns_full.index[0], sp500_price_full.index[0])
+user_end = min(end_date, mag7_returns_full.index[-1], sp500_price_full.index[-1])
+
+mag7_returns_window = mag7_returns_full.loc[user_start:user_end]
+sp500_price_window = sp500_price_full.loc[user_start:user_end]
+
+corr_entropy_full = run_tda_pipeline(mag7_returns_window, window_size)
+takens_entropy_full = run_takens_pipeline(sp500_price_window, window_size, stride=1, dimension=takens_dimension, delay=takens_delay)
+shannon_entropy_full = run_shannon_pipeline(sp500_price_window, window_size, stride=1)
 
 # Compute Wasserstein drift if available
 if DRIFT_AVAILABLE:
-    drift_full = run_drift_pipeline(mag7_returns_full, window_size, stride=1)
+    drift_full = run_drift_pipeline(mag7_returns_window, window_size, stride=1)
 else:
     drift_full = pd.Series(dtype=float)
 
