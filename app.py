@@ -621,20 +621,22 @@ signal_strength = float(np.abs(active_display_signal.mean()) / (active_display_s
 
 historical_threshold_val = active_threshold_signal.quantile(percentile_threshold / 100.0)
 threshold_series = pd.Series(historical_threshold_val, index=active_threshold_signal.index)
-
-view_signal = active_display_signal
-view_threshold = threshold_series
+# Apply sidebar date range filter to all view series
+date_mask = (active_display_signal.index >= start_date) & (active_display_signal.index <= end_date)
+view_signal = active_display_signal.loc[date_mask]
+view_threshold = threshold_series.loc[date_mask]
 view_sp500 = sp500_price.loc[view_signal.index]
+view_threshold_signal = active_threshold_signal.loc[date_mask]
 
 if len(view_signal) == 0:
     st.error("No data in selected range")
     st.stop()
 
-latest_val = float(active_threshold_signal.iloc[-1])
+latest_val = float(view_threshold_signal.iloc[-1])
 display_val = float(view_signal.iloc[-1])
 
-rolling_mean = active_threshold_signal.rolling(ROLLING_WINDOW_DAYS).mean().iloc[-1]
-rolling_std = active_threshold_signal.rolling(ROLLING_WINDOW_DAYS).std().iloc[-1]
+rolling_mean = view_threshold_signal.rolling(ROLLING_WINDOW_DAYS).mean().iloc[-1]
+rolling_std = view_threshold_signal.rolling(ROLLING_WINDOW_DAYS).std().iloc[-1]
 z_score = (latest_val - rolling_mean) / (rolling_std + 1e-8) if rolling_std > 0 else 0
 
 price_trend_5d = view_sp500.pct_change(5).iloc[-1]
